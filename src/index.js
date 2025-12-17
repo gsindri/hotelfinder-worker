@@ -1226,7 +1226,13 @@ export default {
         // 1) Try search context first (from /prefetchCtx)
         if (ctxKey) {
           const ctxData = await kvGetJson(env.CACHE_KV, ctxKey);
-          if (ctxData && Array.isArray(ctxData.properties)) {
+
+          // Explicit ctx failure signals
+          if (!ctxData) {
+            ctxDebug.ctxRejectedReason = "ctx_missing_or_expired";
+          } else if (!Array.isArray(ctxData.properties) || ctxData.properties.length === 0) {
+            ctxDebug.ctxRejectedReason = "ctx_empty";
+          } else {
             // Find matching property using pickBestProperty
             const picked = pickBestProperty(ctxData.properties, hotelName, officialDomain);
 
@@ -1305,8 +1311,13 @@ export default {
       let candidatesDebug = null;
       let debugSearch = debug ? {} : null;
 
+      // Track SearchAPI usage for explicit credit tracking (Fix #4)
+      const usage = { searchapi_calls: { google_hotels: 0, google_hotels_property: 0 } };
+
       if (!tokenObj?.property_token) {
         tokenCacheDetail = "miss";
+
+        usage.searchapi_calls.google_hotels++; // 1 credit for google_hotels
 
         const firstCall = await searchApiCall(env, {
           engine: "google_hotels",
@@ -1417,19 +1428,55 @@ export default {
       const propertyToken = tokenObj.property_token;
 
       // ---- 2) Offers cache ----
-      // Offers can vary by itinerary, currency, adults, region (gl). Keep hlKey in cache key for safety.
-      const offersKey = `offers:${propertyToken}:${checkIn}:${checkOut}:${adults}:${currency}:${gl}:${hlKey}`;
+      // Fix: use hlCacheKey (what's actually sent to API) instead of hlKey (raw input)
+      // This ensures unsupported regional variants (de-AT, de-DE) share cache when API call is identical
+      const hlCacheKey = hlToSend || "nohl";
+      const offersKey = `offers:${propertyToken}:${checkIn}:${checkOut}:${adults}:${currency}:${gl}:${hlCacheKey}`;
       const cached = !refresh ? await kvGetJson(env.CACHE_KV, offersKey) : null;
 
+
       if (cached) {
-        cached.cache = "hit";
-        if (debug) {
-          cached.debug = {
-            ...(cached.debug || {}),
+        // Hydrate cached response with CURRENT request context
+        // Fixes stale match/query/ctxDebug issues
+        const servedAt = new Date().toISOString();
+
+        const hydrated = {
+          ...cached,
+          cache: "hit",
+          servedAt,
+          // Update query to reflect THIS request (not when cached)
+          query: {
+            hotelName,
+            checkIn,
+            checkOut,
+            adults,
+            currency,
+            gl,
+            hl: hlSent || null,
+            hlSentToApi: hlToSend || null,
+            officialDomain: officialDomain || null,
+            currentHost: currentHost || null,
+          },
+          // Update match to reflect THIS request + correct cacheDetail
+          match: {
             cacheDetail: { token: tokenCacheDetail, offers: "hit" },
             tokenCacheKey: tokenKey,
             tokenKeyName,
             tokenKeyDomain: tokenKeyDomain || null,
+            matchedBy: tokenObj?.domainMatch ? "officialDomain" : "name",
+            confidence: tokenObj?.domainMatch ? 0.95 : Math.max(0, Math.min(0.9, tokenObj?.nameScore || 0)),
+            nameScore: tokenObj?.nameScore ?? null,
+            domainMatch: tokenObj?.domainMatch ?? null,
+            linkHost: tokenObj?.linkHost || null,
+            ...ctxDebug,
+          },
+          // Usage: 0 credits on cache hit
+          usage: { searchapi_calls: { google_hotels: 0, google_hotels_property: 0 } },
+        };
+
+        if (debug) {
+          hydrated.debug = {
+            tokenCacheKey: tokenKey,
             offersCacheKey: offersKey,
             tokenObj,
             candidates: candidatesDebug,
@@ -1441,12 +1488,16 @@ export default {
             hlSent,
             hlToSend,
             searchApi: debugSearch,
+            cacheHydrated: true,
           };
         }
-        return jsonResponse(cached, 200, corsHeaders);
+
+        return jsonResponse(hydrated, 200, corsHeaders);
       }
 
       // ---- 3) Fetch property offers ----
+      usage.searchapi_calls.google_hotels_property++; // 1 credit for property offers
+
       const propCall = await searchApiCall(env, {
         engine: "google_hotels_property",
         property_token: propertyToken,
@@ -1597,6 +1648,7 @@ export default {
         cheapestOfficial,
         currentOtaOffer,
         bookingOffer,
+        usage, // Explicit credit tracking: { searchapi_calls: { google_hotels: N, google_hotels_property: N } }
         debug: null, // Will be populated if debug=1
       };
 
