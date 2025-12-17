@@ -1842,14 +1842,6 @@ function jsonResponse(obj, status, corsHeaders) {
   });
 }
 
-async function safeJson(res) {
-  try {
-    return await res.json();
-  } catch {
-    return null;
-  }
-}
-
 async function fetchWithTimeout(url, init = {}, timeoutMs = 6000) {
   const controller = new AbortController();
   const id = setTimeout(() => controller.abort(), timeoutMs);
