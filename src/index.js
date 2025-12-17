@@ -1221,7 +1221,17 @@ export default {
           if (ctxData && Array.isArray(ctxData.properties)) {
             // Find matching property using pickBestProperty
             const picked = pickBestProperty(ctxData.properties, hotelName, officialDomain);
-            if (picked?.best?.property_token) {
+
+            // Only accept ctx token if match quality is high enough
+            // This prevents garbage matches from polluting token cache
+            const CTX_MIN_NAME_SCORE = 0.35;
+            const queryTokens = tokenizeName(hotelName);
+            const acceptCtx = picked?.best?.property_token && (
+              picked.bestDomainMatch ||
+              (picked.bestNameScore >= CTX_MIN_NAME_SCORE && queryTokens.length >= 2)
+            );
+
+            if (acceptCtx) {
               tokenObj = {
                 property_token: picked.best.property_token,
                 property_name: picked.best.name || null,
@@ -1245,6 +1255,9 @@ export default {
                   ctx.waitUntil(kvPutJson(env.CACHE_KV, tokenKeyDomain, tokenObj, TOKEN_TTL_SEC));
                 }
               }
+            } else if (picked?.best?.property_token) {
+              // Match exists but score too low - don't use it
+              tokenCacheDetail = "ctx-nomatch";
             }
           }
         }
