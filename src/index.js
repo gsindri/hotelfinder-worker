@@ -1,3 +1,4 @@
+// @ts-nocheck
 /**
  * Hotel Direct Contact Worker V14 (/compare hardened + officialUrl matching)
  *
@@ -22,6 +23,9 @@
  *  - SearchApi fetch has a timeout and clearer error reporting
  *  - /compare allows requests with no Origin header (curl/server-to-server) while still blocking web origins
  */
+
+// ---------- BUILD INFO ----------
+const BUILD_TAG = "2025-12-17T01:25Z-prefetch-fix";
 
 // ---------- CONTACT LOOKUP CONFIG ----------
 const EMAIL_REGEX = /[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,24}/g;
@@ -159,6 +163,7 @@ function buildCompareCors(request, env) {
   const allowedOrigins = getCompareAllowedOrigins(env);
   const configured = allowedOrigins.size > 0;
 
+  /** @type {Record<string, string>} */
   const base = {
     "Access-Control-Allow-Methods": "GET, HEAD, POST, OPTIONS",
     "Access-Control-Allow-Headers": "Content-Type, Authorization",
@@ -204,6 +209,9 @@ const SEARCHAPI_TIMEOUT_MS = 8000;
 const TOKEN_TTL_SEC = 30 * 24 * 60 * 60; // 30 days
 const TOKEN_TTL_NO_DOMAIN_SEC = 7 * 24 * 60 * 60; // 7 days (fallback caching when official domain is unknown)
 const OFFERS_TTL_SEC = 30 * 60; // 30 minutes
+const CTX_TTL_SEC = 30 * 60; // 30 minutes (search context - short since it's for active session)
+const CTX_RATE_LIMIT = 30; // 30 prefetch calls per hour per IP
+const CTX_WINDOW_SEC = 3600; // 1 hour window for rate limit
 const MAX_OFFERS_RETURNED = 25;
 
 // Supported Google Travel UI languages (SearchApi list)
@@ -221,6 +229,26 @@ const SUPPORTED_TRAVEL_HL = new Set([
 
 function isIsoDate(s) {
   return typeof s === "string" && /^\d{4}-\d{2}-\d{2}$/.test(s);
+}
+
+// --- Shared currency normalization (used by /prefetchCtx and /compare) ---
+const SYMBOL_TO_ISO = {
+  "€": "EUR", "$": "USD", "£": "GBP", "¥": "JPY", "₹": "INR",
+  "₩": "KRW", "₽": "RUB", "₪": "ILS", "฿": "THB", "₫": "VND",
+};
+
+function normalizeCurrencyParam(raw) {
+  if (!raw) return null;
+  const s = raw.trim().toUpperCase();
+
+  // Valid ISO 3-letter code?
+  if (/^[A-Z]{3}$/.test(s)) return s;
+
+  // Try symbol mapping
+  const mapped = SYMBOL_TO_ISO[raw.trim()];
+  if (mapped) return mapped;
+
+  return null; // Invalid - will be omitted from SearchApi call
 }
 
 function nightsBetweenIso(checkIn, checkOut) {
@@ -439,33 +467,63 @@ async function searchApiCall(env, params) {
 function simplifyOffer(o, nights) {
   const link = o?.link || o?.tracking_link || null;
 
-  const totalExtracted = o?.total_price?.extracted_price ?? null;
-  const totalText = o?.total_price?.price ?? null;
+  // Some SearchApi/Google Hotels results only provide "before_taxes" fields.
+  const totalExtracted =
+    o?.total_price?.extracted_price ??
+    o?.total_price?.extracted_price_before_taxes ??
+    null;
 
-  const perNightExtracted = o?.price_per_night?.extracted_price ?? null;
-  const perNightText = o?.price_per_night?.price ?? null;
+  const totalText =
+    o?.total_price?.price ??
+    o?.total_price?.price_before_taxes ??
+    null;
+
+  const perNightExtracted =
+    o?.price_per_night?.extracted_price ??
+    o?.price_per_night?.extracted_price_before_taxes ??
+    null;
+
+  const perNightText =
+    o?.price_per_night?.price ??
+    o?.price_per_night?.price_before_taxes ??
+    null;
+
+  const beforeTaxExtracted = o?.total_price?.extracted_price_before_taxes ?? null;
+  const beforeTaxText = o?.total_price?.price_before_taxes ?? null;
+  const beforeTax = beforeTaxExtracted ?? parseMoneyToNumber(beforeTaxText);
 
   // Canonical total:
-  // 1) total_price.extracted_price
-  // 2) parse from total_price.price
-  // 3) per-night * nights (fallback)
+  // 1) extracted_price
+  // 2) extracted_price_before_taxes
+  // 3) parse from price / price_before_taxes
+  // 4) per-night * nights
   let total = totalExtracted;
   if (total == null) total = parseMoneyToNumber(totalText);
+  if (total == null && beforeTax != null) total = beforeTax;
   if (total == null && perNightExtracted != null && nights) total = perNightExtracted * nights;
-
-  const beforeTaxText = o?.total_price?.price_before_taxes ?? null;
-  const beforeTax = parseMoneyToNumber(beforeTaxText);
 
   return {
     source: o?.source || null,
     isOfficial: o?.is_official === true,
+
+    // total is what you sort/display by (may be before-tax when that's all we get)
     total,
     totalText,
+
+    // keep explicit before-tax fields too (useful for UI labeling later)
     beforeTax,
     beforeTaxText,
+
     perNight: perNightExtracted ?? parseMoneyToNumber(perNightText),
     perNightText,
+
     link,
+
+    // Optional hint for the UI (won't break anything if ignored)
+    totalIsBeforeTax:
+      o?.total_price?.extracted_price == null &&
+      o?.total_price?.price == null &&
+      beforeTax != null,
   };
 }
 
@@ -521,6 +579,66 @@ function findOfferForHost(offers, host) {
   return null;
 }
 
+// ---------- SEARCH CONTEXT (CTX) HELPERS ----------
+
+// Compute ctxId from normalized search params
+function computeCtxId(gl, hlKey, q, checkIn, checkOut, adults, currency) {
+  // Simple stable hash: join normalized values
+  const normalized = [
+    (gl || "us").toLowerCase(),
+    (hlKey || "default").toLowerCase(),
+    normalizeKey(q || ""),
+    checkIn || "",
+    checkOut || "",
+    String(adults || 2),
+    (currency || "USD").toUpperCase(),
+  ].join("|");
+
+  // Simple string hash (djb2)
+  let hash = 5381;
+  for (let i = 0; i < normalized.length; i++) {
+    hash = ((hash << 5) + hash) + normalized.charCodeAt(i);
+    hash = hash & hash; // Convert to 32-bit integer
+  }
+  return Math.abs(hash).toString(36);
+}
+
+// Rate limit for /prefetchCtx - returns Response if blocked, null if allowed
+async function rateLimitPrefetch(request, env, corsHeaders) {
+  if (!env.CACHE_KV) {
+    return jsonResponse({ error: "Missing CACHE_KV binding" }, 500, corsHeaders);
+  }
+
+  const ip = getClientIp(request);
+  const now = Date.now();
+  const hourBucket = Math.floor(now / 3600000);
+  const key = `rl:prefetch:${hourBucket}:${ip}`;
+
+  const currentRaw = await env.CACHE_KV.get(key);
+  const current = currentRaw ? parseInt(currentRaw, 10) : 0;
+
+  if (current >= CTX_RATE_LIMIT) {
+    const secondsIntoHour = Math.floor((now % 3600000) / 1000);
+    const retryAfter = CTX_WINDOW_SEC - secondsIntoHour;
+
+    return new Response(JSON.stringify({ error: "Prefetch rate limit exceeded" }), {
+      status: 429,
+      headers: {
+        "Content-Type": "application/json",
+        "Retry-After": String(retryAfter),
+        ...corsHeaders,
+      },
+    });
+  }
+
+  // Increment
+  await env.CACHE_KV.put(key, String(current + 1), {
+    expirationTtl: CTX_WINDOW_SEC + 60,
+  });
+
+  return null;
+}
+
 // ---------- WORKER ----------
 export default {
   async fetch(request, env, ctx) {
@@ -561,6 +679,146 @@ export default {
         status: 204,
         headers: { ...corsHeaders, "Access-Control-Max-Age": "86400" },
       });
+    }
+
+    // =========================
+    // /__version route (build info)
+    // =========================
+    if (url.pathname === "/__version") {
+      return new Response(JSON.stringify({ build: BUILD_TAG }), {
+        headers: { "content-type": "application/json" }
+      });
+    }
+
+    // =========================
+    // /prefetchCtx route (Search Context prefetch)
+    // =========================
+    if (url.pathname === "/prefetchCtx") {
+      // Use same CORS as /compare (extension-only)
+      const prefetchCors = buildCompareCors(request, env);
+      const prefetchHeaders = prefetchCors.corsHeaders;
+
+      // Handle OPTIONS
+      if (request.method === "OPTIONS") {
+        if (!prefetchCors?.configured || !prefetchCors?.allowed) {
+          return new Response(null, { status: 403, headers: prefetchHeaders });
+        }
+        return new Response(null, {
+          status: 204,
+          headers: { ...prefetchHeaders, "Access-Control-Max-Age": "86400" },
+        });
+      }
+
+      // CORS check
+      if (!prefetchCors?.configured) {
+        return jsonResponse({ error: "Prefetch CORS not configured" }, 500, prefetchHeaders);
+      }
+      if (!prefetchCors?.allowed) {
+        return jsonResponse({ error: "Origin not allowed" }, 403, prefetchHeaders);
+      }
+
+      // Env checks (explicit errors for missing bindings)
+      if (!env.SEARCHAPI_KEY) {
+        return jsonResponse({ error: "Missing SEARCHAPI_KEY binding" }, 500, prefetchHeaders);
+      }
+      if (!env.CACHE_KV) {
+        return jsonResponse({ error: "Missing CACHE_KV binding" }, 500, prefetchHeaders);
+      }
+
+      // Parse params
+      const q = (url.searchParams.get("q") || url.searchParams.get("query") || "").trim();
+      const checkIn = url.searchParams.get("checkIn") || "";
+      const checkOut = url.searchParams.get("checkOut") || "";
+      const adultsRaw = parseInt(url.searchParams.get("adults") || "2", 10);
+      const adults = Math.max(1, Math.min(10, adultsRaw || 2));
+      const currencyRaw = url.searchParams.get("currency") || "";
+      const currency = normalizeCurrencyParam(currencyRaw) || "USD";
+      const gl = (url.searchParams.get("gl") || "us").toLowerCase();
+      const hlRaw = url.searchParams.get("hl") || "";
+      const { hlKey, hlSent } = normalizeTravelHl(hlRaw);
+
+      // Validate required params
+      const missing = [];
+      if (!q) missing.push("q");
+      if (!checkIn) missing.push("checkIn");
+      if (!checkOut) missing.push("checkOut");
+      if (missing.length) {
+        return jsonResponse({ error: "Missing required params", missing }, 400, prefetchHeaders);
+      }
+
+      if (!isIsoDate(checkIn) || !isIsoDate(checkOut)) {
+        return jsonResponse({ error: "Dates must be YYYY-MM-DD", checkIn, checkOut }, 400, prefetchHeaders);
+      }
+
+      // Compute ctxId
+      const ctxId = computeCtxId(gl, hlKey, q, checkIn, checkOut, adults, currency);
+      const ctxKey = `ctx:${ctxId}`;
+
+      // KV-hit-first: check if already cached (0 credits)
+      const refresh = url.searchParams.get("refresh") === "1";
+      if (!refresh) {
+        const cached = await kvGetJson(env.CACHE_KV, ctxKey);
+        if (cached && Array.isArray(cached.properties)) {
+          return jsonResponse({
+            ok: true,
+            ctxId,
+            count: cached.properties.length,
+            cache: "hit",
+          }, 200, prefetchHeaders);
+        }
+      }
+
+      // Rate limit check (only on cache miss, since we're about to spend a credit)
+      const rateLimited = await rateLimitPrefetch(request, env, prefetchHeaders);
+      if (rateLimited) return rateLimited;
+
+      // Call SearchApi google_hotels
+      const searchCall = await searchApiCall(env, {
+        engine: "google_hotels",
+        q,
+        check_in_date: checkIn,
+        check_out_date: checkOut,
+        adults,
+        currency,
+        hl: hlSent,
+        gl,
+      });
+
+      const { res, data } = searchCall;
+
+      if (!res || !res.ok || data?.error) {
+        return jsonResponse({
+          error: "SearchApi google_hotels failed",
+          status: res?.status ?? 0,
+          details: data?.error || data || null,
+          fetchError: searchCall.fetchError || null,
+        }, 502, prefetchHeaders);
+      }
+
+      // Extract minimal property data
+      const rawProperties = data?.properties || [];
+      const minimalProperties = rawProperties.map(p => ({
+        name: p?.name || null,
+        city: p?.city || null,
+        country: p?.country || null,
+        property_token: p?.property_token || null,
+        link: p?.link || null,
+      })).filter(p => p.property_token); // Only keep ones with valid token
+
+      // Store in KV
+      const ctxData = {
+        properties: minimalProperties,
+        createdAt: new Date().toISOString(),
+        query: { q, checkIn, checkOut, adults, currency, gl, hl: hlSent || null },
+      };
+      ctx.waitUntil(kvPutJson(env.CACHE_KV, ctxKey, ctxData, CTX_TTL_SEC));
+
+      return jsonResponse({
+        ok: true,
+        ctxId,
+        count: minimalProperties.length,
+        cache: "miss",
+      }, 200, prefetchHeaders);
     }
 
     // =========================
@@ -615,7 +873,9 @@ export default {
       const adultsRaw = url.searchParams.get("adults");
       const adults = Math.min(10, Math.max(1, parseInt(adultsRaw || "2", 10) || 2));
 
-      const currency = (url.searchParams.get("currency") || "USD").toUpperCase();
+      // --- Currency validation (uses shared normalizeCurrencyParam at module scope) ---
+      const currencyRaw = url.searchParams.get("currency");
+      const currency = normalizeCurrencyParam(currencyRaw) || "USD"; // Default to USD if invalid/missing
       const gl = (url.searchParams.get("gl") || "us").toLowerCase();
 
       // --- Optional matching hints ---
@@ -655,16 +915,87 @@ export default {
       }
 
       // ---- 1) Resolve property_token (cached) ----
-      // Prefer stable official domain over fuzzy name
-      const tokenIdentity = officialDomain ? `d:${officialDomain}` : `n:${normalizeKey(hotelName)}`;
-      const tokenKey = `tok:${gl}:${tokenIdentity}`;
+      // Compute BOTH identity keys for cache aliasing
+      const nameIdentity = `n:${normalizeKey(hotelName)}`;
+      const domainIdentity = officialDomain ? `d:${officialDomain}` : null;
 
-      let tokenObj = !refresh ? await kvGetJson(env.CACHE_KV, tokenKey) : null;
+      const tokenKeyName = `tok:${gl}:${nameIdentity}`;
+      const tokenKeyDomain = domainIdentity ? `tok:${gl}:${domainIdentity}` : null;
+
+      // For backward compat in debug/logging, primary key is domain if available
+      const tokenKey = tokenKeyDomain || tokenKeyName;
+
+      // Track which key we found the token from (for diagnostics)
+      let tokenCacheDetail = "miss";
+
+      // Get ctx (search context) if provided
+      const ctxParam = url.searchParams.get("ctx") || "";
+      const ctxKey = ctxParam ? `ctx:${ctxParam}` : null;
+
+      let tokenObj = null;
+      if (!refresh) {
+        // 1) Try search context first (from /prefetchCtx)
+        if (ctxKey) {
+          const ctxData = await kvGetJson(env.CACHE_KV, ctxKey);
+          if (ctxData && Array.isArray(ctxData.properties)) {
+            // Find matching property using pickBestProperty
+            const picked = pickBestProperty(ctxData.properties, hotelName, officialDomain);
+            if (picked?.best?.property_token) {
+              tokenObj = {
+                property_token: picked.best.property_token,
+                property_name: picked.best.name || null,
+                city: picked.best.city || null,
+                country: picked.best.country || null,
+                link: picked.best.link || null,
+                linkHost: getHostNoWww(picked.best.link || ""),
+                score: picked.bestScore,
+                nameScore: picked.bestNameScore,
+                domainMatch: picked.bestDomainMatch,
+                officialDomain: officialDomain || null,
+                fromCtx: true, // Flag that this came from context
+              };
+              tokenCacheDetail = "ctx-hit";
+
+              // Backfill to token cache for future calls without ctx
+              const shouldBackfill = tokenObj.domainMatch || (tokenObj.nameScore >= 0.55);
+              if (shouldBackfill) {
+                ctx.waitUntil(kvPutJson(env.CACHE_KV, tokenKeyName, tokenObj, TOKEN_TTL_NO_DOMAIN_SEC));
+                if (tokenKeyDomain) {
+                  ctx.waitUntil(kvPutJson(env.CACHE_KV, tokenKeyDomain, tokenObj, TOKEN_TTL_SEC));
+                }
+              }
+            }
+          }
+        }
+
+        // 2) Try domain key (more stable/trusted)
+        if (!tokenObj?.property_token && tokenKeyDomain) {
+          tokenObj = await kvGetJson(env.CACHE_KV, tokenKeyDomain);
+          if (tokenObj?.property_token) {
+            tokenCacheDetail = "hit-domain";
+          }
+        }
+
+        // 3) Fallback to name key
+        if (!tokenObj?.property_token) {
+          tokenObj = await kvGetJson(env.CACHE_KV, tokenKeyName);
+          if (tokenObj?.property_token) {
+            tokenCacheDetail = "hit-name";
+
+            // Backfill: If we have domain key but found via name, copy to domain cache
+            if (tokenKeyDomain) {
+              ctx.waitUntil(kvPutJson(env.CACHE_KV, tokenKeyDomain, tokenObj, TOKEN_TTL_SEC));
+            }
+          }
+        }
+      }
 
       let candidatesDebug = null;
       let debugSearch = debug ? {} : null;
 
       if (!tokenObj?.property_token) {
+        tokenCacheDetail = "miss";
+
         const firstCall = await searchApiCall(env, {
           engine: "google_hotels",
           q: hotelName,
@@ -745,14 +1076,21 @@ export default {
           });
         }
 
-        // Cache token:
-        // - If domainMatch (officialUrl) => always cache, long TTL.
-        // - If only name match => cache only when strong name score, shorter TTL.
+        // Cache token to BOTH keys
+        // - Name key: always cache (shorter TTL if no domain match)
+        // - Domain key: cache if we have officialDomain
         const shouldCache = tokenObj.domainMatch === true || (tokenObj.nameScore != null && tokenObj.nameScore >= 0.55);
-        const tokenTtl = tokenObj.domainMatch === true ? TOKEN_TTL_SEC : TOKEN_TTL_NO_DOMAIN_SEC;
 
         if (shouldCache) {
-          ctx.waitUntil(kvPutJson(env.CACHE_KV, tokenKey, tokenObj, tokenTtl));
+          const nameTtl = tokenObj.domainMatch ? TOKEN_TTL_SEC : TOKEN_TTL_NO_DOMAIN_SEC;
+
+          // Always write to name key
+          ctx.waitUntil(kvPutJson(env.CACHE_KV, tokenKeyName, tokenObj, nameTtl));
+
+          // Also write to domain key if available (with longer TTL)
+          if (tokenKeyDomain) {
+            ctx.waitUntil(kvPutJson(env.CACHE_KV, tokenKeyDomain, tokenObj, TOKEN_TTL_SEC));
+          }
         }
       }
 
@@ -768,7 +1106,10 @@ export default {
         if (debug) {
           cached.debug = {
             ...(cached.debug || {}),
+            cacheDetail: { token: tokenCacheDetail, offers: "hit" },
             tokenCacheKey: tokenKey,
+            tokenKeyName,
+            tokenKeyDomain: tokenKeyDomain || null,
             offersCacheKey: offersKey,
             tokenObj,
             candidates: candidatesDebug,
@@ -833,24 +1174,59 @@ export default {
         return jsonResponse({ error: "Missing property in response", details: propData, debug: debugSearch }, 502, corsHeaders);
       }
 
+      // --- Debug: Track raw counts ---
+      const rawFeaturedCount = prop.featured_offers?.length || 0;
+      const rawAllCount = prop.all_offers?.length || 0;
+
       const combined = [
         ...(Array.isArray(prop.featured_offers) ? prop.featured_offers : []),
         ...(Array.isArray(prop.all_offers) ? prop.all_offers : []),
       ];
+      const combinedCount = combined.length;
 
       // Deduplicate by source + total + link
       const seen = new Set();
       const simplified = [];
+      let droppedNoTotal = 0;
+      let droppedDedup = 0;
       for (const o of combined) {
         const s = simplifyOffer(o, nights);
         const dedupeKey = `${normalizeOtaKey(s.source)}|${s.total ?? "na"}|${String(s.link || "").slice(0, 80)}`;
-        if (seen.has(dedupeKey)) continue;
+        if (seen.has(dedupeKey)) {
+          droppedDedup++;
+          continue;
+        }
         seen.add(dedupeKey);
-        if (s.total == null) continue; // don’t include offers we can’t price
+        if (s.total == null) {
+          droppedNoTotal++;
+          continue;
+        } // don’t include offers we can’t price
         simplified.push(s);
       }
 
       simplified.sort((a, b) => (a.total ?? 1e18) - (b.total ?? 1e18));
+
+      // --- Debug: raw counts object (only when debug=1) ---
+      const rawCountsDebug = debug ? {
+        rawFeaturedCount,
+        rawAllCount,
+        combinedCount,
+        kept: simplified.length,
+        droppedNoTotal,
+        droppedDedup,
+      } : null;
+
+      // --- Debug: sample raw offer ---
+      const sampleRawOfferDebug = debug && combined[0] ? {
+        source: combined[0].source,
+        total_price: combined[0].total_price,
+        price_per_night: combined[0].price_per_night,
+        link: combined[0].link,
+        tracking_link: combined[0].tracking_link,
+      } : null;
+
+      // --- Debug: prop keys ---
+      const propKeysDebug = debug ? Object.keys(prop).slice(0, 60) : null;
 
       const cheapestOverall = simplified[0] || null;
       const cheapestOfficial = simplified.find((o) => o.isOfficial) || null;
@@ -876,7 +1252,10 @@ export default {
         },
         nights,
         match: {
+          cacheDetail: { token: tokenCacheDetail, offers: "miss" },
           tokenCacheKey: tokenKey,
+          tokenKeyName,
+          tokenKeyDomain: tokenKeyDomain || null,
           matchedBy: tokenObj.domainMatch ? "officialDomain" : "name",
           confidence: tokenObj.domainMatch ? 0.95 : Math.max(0, Math.min(0.9, tokenObj.nameScore || 0)),
           nameScore: tokenObj.nameScore ?? null,
@@ -896,6 +1275,7 @@ export default {
         cheapestOfficial,
         currentOtaOffer,
         bookingOffer,
+        debug: null, // Will be populated if debug=1
       };
 
       if (debug) {
@@ -912,6 +1292,10 @@ export default {
           hlSent,
           hlToSend,
           searchApi: debugSearch,
+          // --- New debug diagnostics ---
+          rawCounts: rawCountsDebug,
+          sampleRawOffer: sampleRawOfferDebug,
+          propKeys: propKeysDebug,
         };
       }
 
@@ -1179,7 +1563,7 @@ function normalizeEmail(raw) {
   let e = decodeHtmlEntities(String(raw)).trim();
   e = e.replace(/^mailto:/i, "");
   e = e.replace(/[>\])}.,;:'"]+$/g, "");
-  try { e = decodeURIComponent(e); } catch {}
+  try { e = decodeURIComponent(e); } catch { }
   e = e.trim();
 
   if (!EMAIL_REGEX_ANCHORED.test(e)) return null;
@@ -1224,7 +1608,7 @@ function extractEmailsFromJsonLd(html) {
     try {
       const json = JSON.parse(decodeHtmlEntities(raw));
       deepCollectEmails(json, out);
-    } catch {}
+    } catch { }
   }
   return out;
 }
@@ -1472,7 +1856,7 @@ function extractDuckDuckGoResultUrls(ddgHtml, max = 3) {
       const u = new URL(href, "https://duckduckgo.com");
       const uddg = u.searchParams.get("uddg");
       href = uddg ? decodeURIComponent(uddg) : u.href;
-    } catch {}
+    } catch { }
 
     if (!/^https?:\/\//i.test(href)) continue;
 
