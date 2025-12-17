@@ -1635,29 +1635,52 @@ export default {
         websiteUrl = null;
       }
 
-      // --- Step 2b: Website Recovery (DuckDuckGo + Strict Match) ---
+      // --- Step 2b: Website Recovery (Search API first, DDG as last resort) ---
       if (!websiteUrl) {
-        if (debugInfo) debugInfo.steps.push("Attempting Website Recovery via DDG...");
+        // Try API fallback first (Brave / Google CSE)
+        const hasFallbackApi = getBraveApiKey(env) || (getGoogleCseKey(env) && getGoogleCseCx(env));
 
-        const ddgQuery = `${query} official website`;
-        const ddgRes = await fetchWithTimeout(
-          `https://html.duckduckgo.com/html?q=${encodeURIComponent(ddgQuery)}`,
-          { headers: { "User-Agent": USER_AGENT } },
-          TIMEOUT_HOME_MS
-        );
+        if (hasFallbackApi) {
+          if (debugInfo) debugInfo.steps.push("Attempting Website Recovery via Search API...");
 
-        if (ddgRes?.ok) {
-          const ddgHtml = await ddgRes.text();
-          const resultUrls = extractDuckDuckGoResultUrls(ddgHtml, 4);
+          const websiteQuery = `${query} official website`;
+          const { provider, urls } = await fallbackSearchUrls(env, ctx, websiteQuery, { cacheKeyPrefix: "sf:site" });
 
-          const recoveredUrl = resultUrls.find((u) => {
-            if (isSocialOrOta(u)) return false;
-            return isPlausibleDomain(u, query);
-          });
+          const filtered = urls.filter((u) => !isSocialOrOta(u) && isPlausibleDomain(u, query));
+          const recovered = filtered[0] || null;
 
-          if (recoveredUrl) {
-            websiteUrl = recoveredUrl;
-            if (debugInfo) debugInfo.steps.push(`Recovered and verified website: ${websiteUrl}`);
+          if (recovered) {
+            websiteUrl = recovered;
+            if (debugInfo) debugInfo.steps.push(`Recovered website via Search API (${provider || "unknown"}): ${websiteUrl}`);
+          } else if (debugInfo) {
+            debugInfo.steps.push(`Search API website recovery (${provider || "unknown"}) returned no plausible site`);
+          }
+        }
+
+        // DDG HTML as last resort if API didn't work
+        if (!websiteUrl) {
+          if (debugInfo) debugInfo.steps.push("Attempting Website Recovery via DDG...");
+
+          const ddgQuery = `${query} official website`;
+          const ddgRes = await fetchWithTimeout(
+            `https://html.duckduckgo.com/html?q=${encodeURIComponent(ddgQuery)}`,
+            { headers: { "User-Agent": USER_AGENT } },
+            TIMEOUT_HOME_MS
+          );
+
+          if (ddgRes?.ok) {
+            const ddgHtml = await ddgRes.text();
+            const resultUrls = extractDuckDuckGoResultUrls(ddgHtml, 4);
+
+            const recoveredUrl = resultUrls.find((u) => {
+              if (isSocialOrOta(u)) return false;
+              return isPlausibleDomain(u, query);
+            });
+
+            if (recoveredUrl) {
+              websiteUrl = recoveredUrl;
+              if (debugInfo) debugInfo.steps.push(`Recovered and verified website via DDG: ${websiteUrl}`);
+            }
           }
         }
       }
@@ -1707,7 +1730,78 @@ export default {
         }
       }
 
-      // --- Step 4: Last Resort Fallback (Global DDG email search) ---
+      // --- Step 3c: Site-Search Fallback (if website known but no email yet) ---
+      if (!result.found_email && result.website) {
+        const hasFallbackApi = getBraveApiKey(env) || (getGoogleCseKey(env) && getGoogleCseCx(env));
+
+        if (hasFallbackApi) {
+          const host = getHostNoWww(result.website);
+          if (host) {
+            if (debugInfo) debugInfo.steps.push(`Attempting site-search fallback for ${host}...`);
+
+            const siteQuery = `site:${host} (contact OR kontakt OR impressum OR reservation OR booking) (email OR mailto)`;
+            const { provider, urls } = await fallbackSearchUrls(env, ctx, siteQuery, { cacheKeyPrefix: `sf:in:${host}` });
+
+            const hostMatches = makeHostMatcher(result.website);
+            const candidateUrls = rankContactUrls(urls.filter((u) => hostMatches(u) && !isSocialOrOta(u))).slice(0, FALLBACK_SEARCH_MAX_PAGES_TO_CRAWL);
+
+            if (candidateUrls.length) {
+              const pages = (await Promise.all(candidateUrls.map((u) => fetchEmailsPage(u, result.website, TIMEOUT_PAGE_MS, debugInfo)))).filter(Boolean);
+              const best = pickBestEmailFromPages(pages, result.website, { minScore: 5 });
+
+              if (best) {
+                result.found_email = best;
+                if (debugInfo) debugInfo.steps.push(`Found email via site-search fallback (${provider || "unknown"}): ${best}`);
+              }
+            }
+          }
+        }
+      }
+
+      // --- Step 4: Global-Search Fallback (URL-first, then crawl) ---
+      if (!result.found_email) {
+        const hasFallbackApi = getBraveApiKey(env) || (getGoogleCseKey(env) && getGoogleCseCx(env));
+
+        if (hasFallbackApi) {
+          if (debugInfo) debugInfo.steps.push("Attempting global-search fallback...");
+
+          const globalQuery = `${query} email contact`;
+          const { provider, urls } = await fallbackSearchUrls(env, ctx, globalQuery, { cacheKeyPrefix: "sf:global", cacheTtlSec: 24 * 60 * 60 });
+
+          // Rank URLs: prefer official domain, contact-ish URLs, plausible domains
+          const officialHost = getHostNoWww(result.website || "");
+          const hostMatches = officialHost ? makeHostMatcher("https://" + officialHost) : null;
+
+          const scored = [];
+          for (const u of urls) {
+            if (isSocialOrOta(u)) continue;
+
+            let pts = 0;
+            if (hostMatches && hostMatches(u)) pts += 200;
+            if (isPlausibleDomain(u, query)) pts += 30;
+
+            const low = u.toLowerCase();
+            if (CONTACT_HINTS.some((h) => low.includes(h))) pts += 50;
+
+            scored.push({ u, pts });
+          }
+
+          scored.sort((a, b) => b.pts - a.pts);
+          const candidateUrls = scored.map((x) => x.u).slice(0, FALLBACK_SEARCH_MAX_PAGES_TO_CRAWL);
+
+          if (candidateUrls.length) {
+            const pages = (await Promise.all(candidateUrls.map((u) => fetchEmailsPage(u, result.website || "", TIMEOUT_PAGE_MS, debugInfo)))).filter(Boolean);
+            const best = pickBestEmailFromPages(pages, result.website || "", { minScore: 5 });
+
+            if (best) {
+              result.found_email = best;
+              if (debugInfo) debugInfo.steps.push(`Found email via global-search fallback (${provider || "unknown"}): ${best}`);
+            }
+          }
+        }
+      }
+
+      // --- Step 5: Last Resort Fallback (DDG snippet scraping) ---
       if (!result.found_email) {
         const ddgQuery = `${query} email contact address`;
 
@@ -1727,7 +1821,7 @@ export default {
 
           if (snippetBest) {
             result.found_email = snippetBest;
-            if (debugInfo) debugInfo.steps.push(`Found email via Global Search: ${snippetBest}`);
+            if (debugInfo) debugInfo.steps.push(`Found email via DDG snippet: ${snippetBest}`);
           }
         }
       }
