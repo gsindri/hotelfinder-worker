@@ -25,7 +25,7 @@
  */
 
 // ---------- BUILD INFO ----------
-const BUILD_TAG = "2025-12-17T01:25Z-prefetch-fix";
+const BUILD_TAG = "2025-12-17T03:40Z-search-fallback";
 
 // ---------- CONTACT LOOKUP CONFIG ----------
 const EMAIL_REGEX = /[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,24}/g;
@@ -58,7 +58,16 @@ const USER_AGENT =
 
 const TIMEOUT_HOME_MS = 6000;
 const TIMEOUT_PAGE_MS = 4000;
-const MAX_CONTACT_PAGES = 3;
+const MAX_CONTACT_PAGES = 5; // Increased from 3 for better hit-rate on multilingual sites
+
+// ---------- SEARCH API FALLBACK CONFIG ----------
+const BRAVE_SEARCH_ENDPOINT = "https://api.search.brave.com/res/v1/web/search";
+const GOOGLE_CSE_ENDPOINT = "https://customsearch.googleapis.com/customsearch/v1";
+const FALLBACK_SEARCH_TIMEOUT_MS = 8000;
+const FALLBACK_SEARCH_MAX_RESULTS = 8;
+const FALLBACK_SEARCH_MAX_PAGES_TO_CRAWL = 5;
+const FALLBACK_SEARCH_CACHE_TTL_SEC = 7 * 24 * 60 * 60; // 7 days
+const MAX_EMAIL_PARSE_BYTES = 2 * 1024 * 1024; // 2 MB
 
 // ---------- RATE LIMITING (for /compare only) ----------
 const COMPARE_RATE_LIMIT = 60; // requests
@@ -637,6 +646,278 @@ async function rateLimitPrefetch(request, env, corsHeaders) {
   });
 
   return null;
+}
+
+// ---------- SEARCH API FALLBACK HELPERS ----------
+
+function cleanSearchResultUrl(urlStr) {
+  const raw = String(urlStr || "").trim();
+  if (!raw) return null;
+  try {
+    const u = new URL(raw);
+    if (u.protocol !== "http:" && u.protocol !== "https:") return null;
+    u.hash = "";
+    return u.toString();
+  } catch {
+    try {
+      const u = new URL("https://" + raw);
+      if (u.protocol !== "http:" && u.protocol !== "https:") return null;
+      u.hash = "";
+      return u.toString();
+    } catch {
+      return null;
+    }
+  }
+}
+
+function dedupeUrls(urls) {
+  const out = [];
+  const seen = new Set();
+  for (const u of Array.isArray(urls) ? urls : []) {
+    const cleaned = cleanSearchResultUrl(u);
+    if (!cleaned) continue;
+    const key = cleaned.toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(cleaned);
+  }
+  return out;
+}
+
+function getBraveApiKey(env) {
+  return env.BRAVE_SEARCH_API_KEY || env.BRAVE_API_KEY || env.BRAVE_KEY || "";
+}
+
+function getGoogleCseKey(env) {
+  return env.GOOGLE_CSE_API_KEY || env.GOOGLE_CSE_KEY || "";
+}
+
+function getGoogleCseCx(env) {
+  return env.GOOGLE_CSE_CX || env.GOOGLE_CSE_ID || env.GOOGLE_CSE_ENGINE_ID || "";
+}
+
+async function fetchWithTimeoutSimple(url, options, timeoutMs) {
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const res = await fetch(url, { ...options, signal: controller.signal });
+    clearTimeout(timeoutId);
+    return res;
+  } catch (e) {
+    clearTimeout(timeoutId);
+    return null;
+  }
+}
+
+async function safeJson(res) {
+  try {
+    return await res.json();
+  } catch {
+    return null;
+  }
+}
+
+async function braveSearchUrlsDetailed(env, q, count) {
+  const key = getBraveApiKey(env);
+  if (!key) return { provider: null, urls: [] };
+
+  const u = new URL(BRAVE_SEARCH_ENDPOINT);
+  u.searchParams.set("q", q);
+  u.searchParams.set("count", String(Math.min(20, Math.max(1, count || FALLBACK_SEARCH_MAX_RESULTS))));
+
+  const res = await fetchWithTimeoutSimple(
+    u.toString(),
+    {
+      headers: {
+        "Accept": "application/json",
+        "X-Subscription-Token": key
+      }
+    },
+    FALLBACK_SEARCH_TIMEOUT_MS
+  );
+
+  if (!res?.ok) return { provider: "brave", urls: [] };
+
+  const data = await safeJson(res);
+  const results = data?.web?.results;
+  const urls = [];
+  if (Array.isArray(results)) {
+    for (const r of results) {
+      const link = r?.url || r?.link || r?.profile?.url;
+      if (typeof link === "string") urls.push(link);
+    }
+  }
+  return { provider: "brave", urls: dedupeUrls(urls) };
+}
+
+async function googleCseUrlsDetailed(env, q, count) {
+  const key = getGoogleCseKey(env);
+  const cx = getGoogleCseCx(env);
+  if (!key || !cx) return { provider: null, urls: [] };
+
+  const u = new URL(GOOGLE_CSE_ENDPOINT);
+  u.searchParams.set("key", key);
+  u.searchParams.set("cx", cx);
+  u.searchParams.set("q", q);
+  u.searchParams.set("num", String(Math.min(10, Math.max(1, count || FALLBACK_SEARCH_MAX_RESULTS))));
+
+  const res = await fetchWithTimeoutSimple(
+    u.toString(),
+    { headers: { "Accept": "application/json" } },
+    FALLBACK_SEARCH_TIMEOUT_MS
+  );
+
+  if (!res?.ok) return { provider: "google_cse", urls: [] };
+
+  const data = await safeJson(res);
+  const items = data?.items;
+  const urls = [];
+  if (Array.isArray(items)) {
+    for (const it of items) {
+      if (typeof it?.link === "string") urls.push(it.link);
+    }
+  }
+  return { provider: "google_cse", urls: dedupeUrls(urls) };
+}
+
+function preferredFallbackProvider(env) {
+  const p = String(env.SEARCH_FALLBACK_PROVIDER || "").toLowerCase().trim();
+  if (p === "google" || p === "cse" || p === "google_cse") return "google";
+  if (p === "brave") return "brave";
+  return "brave"; // default
+}
+
+async function fallbackSearchUrls(env, ctx, q, { count = FALLBACK_SEARCH_MAX_RESULTS, cacheKeyPrefix = "sf", cacheTtlSec = FALLBACK_SEARCH_CACHE_TTL_SEC } = {}) {
+  const cacheKey = `${cacheKeyPrefix}:${normalizeKey(q)}`;
+
+  if (env.CACHE_KV) {
+    const cached = await kvGetJson(env.CACHE_KV, cacheKey);
+    if (cached?.urls && Array.isArray(cached.urls) && cached.urls.length) {
+      return { provider: cached.provider || null, urls: cached.urls, cache: "hit" };
+    }
+  }
+
+  const prefer = preferredFallbackProvider(env);
+  let out = { provider: null, urls: [] };
+
+  if (prefer === "google") {
+    out = await googleCseUrlsDetailed(env, q, count);
+    if (!out.urls.length) out = await braveSearchUrlsDetailed(env, q, count);
+  } else {
+    out = await braveSearchUrlsDetailed(env, q, count);
+    if (!out.urls.length) out = await googleCseUrlsDetailed(env, q, count);
+  }
+
+  if (env.CACHE_KV && out.urls.length) {
+    ctx.waitUntil(kvPutJson(env.CACHE_KV, cacheKey, { provider: out.provider, urls: out.urls }, cacheTtlSec));
+  }
+
+  return { ...out, cache: "miss" };
+}
+
+function isEmailParsableResponse(res) {
+  const ctype = (res.headers.get("content-type") || "").toLowerCase();
+  return (
+    ctype.includes("text/html") ||
+    ctype.includes("application/xhtml+xml") ||
+    ctype.includes("text/plain") ||
+    ctype.includes("application/pdf")
+  );
+}
+
+async function fetchEmailsPage(url, websiteUrl, timeout, debugInfo) {
+  const res = await fetchWithTimeoutSimple(
+    url,
+    {
+      headers: {
+        "User-Agent": USER_AGENT,
+        "Accept": "text/html,application/xhtml+xml,text/plain,application/pdf;q=0.9,*/*;q=0.1"
+      },
+      redirect: "follow"
+    },
+    timeout
+  );
+
+  if (!res?.ok || !isEmailParsableResponse(res)) return null;
+
+  const actualUrl = res.url || url;
+  if (debugInfo) debugInfo.checked_urls.push(actualUrl);
+
+  const lenHeader = res.headers.get("content-length");
+  const len = lenHeader ? parseInt(lenHeader, 10) : null;
+  if (len != null && Number.isFinite(len) && len > MAX_EMAIL_PARSE_BYTES) return null;
+
+  const ctype = (res.headers.get("content-type") || "").toLowerCase();
+  let bodyText = "";
+
+  if (ctype.includes("application/pdf")) {
+    const buf = await res.arrayBuffer();
+    if (buf.byteLength > MAX_EMAIL_PARSE_BYTES) return null;
+    bodyText = new TextDecoder("utf-8").decode(buf);
+  } else {
+    bodyText = await res.text();
+  }
+
+  const emails = bodyText.match(EMAIL_REGEX) || [];
+  if (debugInfo && emails.length) debugInfo.email_candidates.push({ url: actualUrl, emails });
+
+  return { url: actualUrl, emails };
+}
+
+function pickBestEmailFromPages(pages, websiteUrl, { minScore = 5 } = {}) {
+  if (!Array.isArray(pages) || pages.length === 0) return null;
+
+  const websiteHost = websiteUrl ? new URL(websiteUrl).hostname.replace(/^www\./i, "") : "";
+  const denyDomainFragments = [
+    "ingest.sentry.io", "sentry.io", "wixpress.com", "wix.com",
+    "cloudflare.com", "example.com", "domain.com", "duckduckgo.com",
+    "google.com", "yandex.ru"
+  ];
+
+  const bestByEmail = new Map();
+
+  for (const p of pages) {
+    const sourceUrl = String(p?.url || "");
+    const emails = Array.isArray(p?.emails) ? p.emails : [];
+
+    for (const email of emails) {
+      const lower = email.toLowerCase();
+      const parts = lower.split("@");
+      const local = parts[0] || "";
+      const domain = (parts[1] || "").replace(/^www\./, "");
+      const tld = domain.split(".").pop() || "";
+
+      let score = 0;
+
+      if (websiteHost && (domain === websiteHost || domain.endsWith("." + websiteHost) || websiteHost.endsWith("." + domain))) {
+        score += 100;
+      }
+      if (/(info|contact|reservation|reservations|booking|reception|frontdesk|hello|stay|office|hallo|halló)/i.test(local)) {
+        score += 15;
+      }
+      if (/contact|kontakt|impressum|reservation|booking/i.test(sourceUrl)) {
+        score += 10;
+      }
+      if (JUNK_DOMAINS.some(j => domain.includes(j))) {
+        score -= 500;
+      }
+      if (/(noreply|no-reply|donotreply|mailer-daemon|postmaster)/i.test(local)) {
+        score -= 50;
+      }
+      if (denyDomainFragments.some(f => domain.includes(f))) {
+        score -= 80;
+      }
+      if (BAD_TLDS.has(tld)) {
+        score -= 200;
+      }
+
+      const prev = bestByEmail.get(lower);
+      if (!prev || score > prev.score) bestByEmail.set(lower, { email, score });
+    }
+  }
+
+  const scored = [...bestByEmail.values()].sort((a, b) => b.score - a.score);
+  return scored[0]?.score >= minScore ? scored[0].email : null;
 }
 
 // ---------- WORKER ----------
