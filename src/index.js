@@ -1213,6 +1213,14 @@ export default {
       const ctxParam = url.searchParams.get("ctx") || "";
       const ctxKey = ctxParam ? `ctx:${ctxParam}` : null;
 
+      // Track ctx debug info for response
+      let ctxDebug = {
+        ctxAttempted: !!ctxKey,
+        ctxHit: false,
+        ctxNameScore: null,
+        ctxRejectedReason: null,
+      };
+
       let tokenObj = null;
       if (!refresh) {
         // 1) Try search context first (from /prefetchCtx)
@@ -1231,6 +1239,10 @@ export default {
               (picked.bestNameScore >= CTX_MIN_NAME_SCORE && queryTokens.length >= 2)
             );
 
+            // Always populate ctx debug info
+            ctxDebug.ctxNameScore = picked?.bestNameScore ?? null;
+            ctxDebug.ctxMatchedProperty = picked?.best?.name || null;
+
             if (acceptCtx) {
               tokenObj = {
                 property_token: picked.best.property_token,
@@ -1246,6 +1258,7 @@ export default {
                 fromCtx: true, // Flag that this came from context
               };
               tokenCacheDetail = "ctx-hit";
+              ctxDebug.ctxHit = true;
 
               // Backfill to token cache for future calls without ctx
               const shouldBackfill = tokenObj.domainMatch || (tokenObj.nameScore >= 0.55);
@@ -1258,6 +1271,11 @@ export default {
             } else if (picked?.best?.property_token) {
               // Match exists but score too low - don't use it
               tokenCacheDetail = "ctx-nomatch";
+              ctxDebug.ctxRejectedReason = picked.bestNameScore < CTX_MIN_NAME_SCORE
+                ? `score_too_low:${picked.bestNameScore?.toFixed(3)}`
+                : queryTokens.length < 2 ? "query_too_short" : "unknown";
+            } else {
+              ctxDebug.ctxRejectedReason = "no_matching_property";
             }
           }
         }
@@ -1336,7 +1354,15 @@ export default {
         const picked = pickBestProperty(props, hotelName, officialDomain);
 
         if (!picked?.best?.property_token) {
-          return jsonResponse({ error: "No property_token found for hotel", hotelName, officialDomain: officialDomain || null, debug: debugSearch }, 404, corsHeaders);
+          return jsonResponse({
+            ok: false,
+            error: "No property_token found for hotel",
+            error_code: "NO_PROPERTY_FOUND",
+            hotelName,
+            officialDomain: officialDomain || null,
+            ctxDebug,
+            debug: debugSearch
+          }, 404, corsHeaders);
         }
 
         tokenObj = {
@@ -1555,6 +1581,8 @@ export default {
           nameScore: tokenObj.nameScore ?? null,
           domainMatch: tokenObj.domainMatch ?? null,
           linkHost: tokenObj.linkHost || null,
+          // Ctx debug info: shows whether ctx was attempted and why it succeeded/failed
+          ...ctxDebug,
         },
         property: {
           name: prop.name || tokenObj.property_name || hotelName,
