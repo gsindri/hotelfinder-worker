@@ -473,6 +473,20 @@ async function searchApiCall(env, params) {
   return { ...out, hlFallback: false };
 }
 
+function extractBadges(raw) {
+  const badges = [];
+  // Check various label fields from Google Hotels response
+  const label = String(raw?.label || raw?.badge || raw?.promo_label || '').toLowerCase();
+  const features = (raw?.features || []).join(' ').toLowerCase();
+  const combined = label + ' ' + features;
+
+  if (/member|loyalty|genius|vip|rewards/i.test(combined)) badges.push('Member');
+  if (/sign.?in|log.?in|login/i.test(combined)) badges.push('Login');
+  if (/mobile|app.only/i.test(combined)) badges.push('Mobile');
+  if (/coupon|promo/i.test(combined)) badges.push('Promo');
+  return badges;
+}
+
 function simplifyOffer(o, nights) {
   const link = o?.link || o?.tracking_link || null;
 
@@ -533,6 +547,9 @@ function simplifyOffer(o, nights) {
       o?.total_price?.extracted_price == null &&
       o?.total_price?.price == null &&
       beforeTax != null,
+
+    // Badges for member/login/mobile pricing
+    badges: extractBadges(o),
   };
 }
 
@@ -1465,6 +1482,7 @@ export default {
             tokenKeyDomain: tokenKeyDomain || null,
             matchedBy: tokenObj?.domainMatch ? "officialDomain" : "name",
             confidence: tokenObj?.domainMatch ? 0.95 : Math.max(0, Math.min(0.9, tokenObj?.nameScore || 0)),
+            matchedHotelName: tokenObj?.property_name || null,
             nameScore: tokenObj?.nameScore ?? null,
             domainMatch: tokenObj?.domainMatch ?? null,
             linkHost: tokenObj?.linkHost || null,
@@ -1629,6 +1647,7 @@ export default {
           tokenKeyDomain: tokenKeyDomain || null,
           matchedBy: tokenObj.domainMatch ? "officialDomain" : "name",
           confidence: tokenObj.domainMatch ? 0.95 : Math.max(0, Math.min(0.9, tokenObj.nameScore || 0)),
+          matchedHotelName: tokenObj.property_name || null,
           nameScore: tokenObj.nameScore ?? null,
           domainMatch: tokenObj.domainMatch ?? null,
           linkHost: tokenObj.linkHost || null,
