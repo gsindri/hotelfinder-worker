@@ -473,7 +473,7 @@ async function searchApiCall(env, params) {
   return { ...out, hlFallback: false };
 }
 
-function extractBadges(raw) {
+function extractBadges(raw, debug = false) {
   const badges = [];
   // Check various label fields from Google Hotels response
   // Google uses different field names across their API versions
@@ -504,6 +504,30 @@ function extractBadges(raw) {
   if (/sign.?in|log.?in|login|registered/i.test(combined)) badges.push('Login');
   if (/mobile|app.only/i.test(combined)) badges.push('Mobile');
   if (/coupon|promo|deal|discount/i.test(combined)) badges.push('Promo');
+
+  // Return debug info if requested
+  if (debug) {
+    return {
+      badges,
+      debug: {
+        labelSourcesFound: labelSources,
+        combinedString: combined.slice(0, 500),
+        rawKeys: raw ? Object.keys(raw) : [],
+        totalPriceKeys: raw?.total_price ? Object.keys(raw.total_price) : [],
+        pricePerNightKeys: raw?.price_per_night ? Object.keys(raw.price_per_night) : [],
+        hasFeatures: Boolean(raw?.features?.length),
+        sampleFields: {
+          source: raw?.source,
+          is_official: raw?.is_official,
+          label: raw?.label,
+          badge: raw?.badge,
+          rate_type: raw?.rate_type,
+          offer_type: raw?.offer_type,
+        },
+      },
+    };
+  }
+
   return badges;
 }
 
@@ -1593,6 +1617,9 @@ export default {
       ];
       const combinedCount = combined.length;
 
+      // Debug: capture badge extraction info for first raw offer
+      const badgeDebugInfo = debug && combined[0] ? extractBadges(combined[0], true) : null;
+
       // Deduplicate by source + total + link
       const seen = new Set();
       const simplified = [];
@@ -1709,6 +1736,8 @@ export default {
           rawCounts: rawCountsDebug,
           sampleRawOffer: sampleRawOfferDebug,
           propKeys: propKeysDebug,
+          // Badge extraction debug for first raw offer
+          badgeDebug: badgeDebugInfo,
         };
       }
 
