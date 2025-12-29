@@ -476,14 +476,34 @@ async function searchApiCall(env, params) {
 function extractBadges(raw) {
   const badges = [];
   // Check various label fields from Google Hotels response
-  const label = String(raw?.label || raw?.badge || raw?.promo_label || '').toLowerCase();
+  // Google uses different field names across their API versions
+  const labelSources = [
+    raw?.label,
+    raw?.badge,
+    raw?.promo_label,
+    raw?.rate_label,
+    raw?.offer_label,
+    raw?.discount_label,
+    raw?.loyalty_label,
+    raw?.total_price?.label,
+    raw?.total_price?.badge,
+    raw?.price_per_night?.label,
+    // Sometimes labels are in an array
+    ...(Array.isArray(raw?.labels) ? raw.labels : []),
+    ...(Array.isArray(raw?.badges) ? raw.badges : []),
+    // Stringify certain objects to catch nested labels
+    raw?.offer_type,
+    raw?.rate_type,
+  ].filter(Boolean);
+
+  const label = labelSources.join(' ').toLowerCase();
   const features = (raw?.features || []).join(' ').toLowerCase();
   const combined = label + ' ' + features;
 
-  if (/member|loyalty|genius|vip|rewards/i.test(combined)) badges.push('Member');
-  if (/sign.?in|log.?in|login/i.test(combined)) badges.push('Login');
+  if (/member|loyalty|genius|vip|rewards|exclusive/i.test(combined)) badges.push('Member');
+  if (/sign.?in|log.?in|login|registered/i.test(combined)) badges.push('Login');
   if (/mobile|app.only/i.test(combined)) badges.push('Mobile');
-  if (/coupon|promo/i.test(combined)) badges.push('Promo');
+  if (/coupon|promo|deal|discount/i.test(combined)) badges.push('Promo');
   return badges;
 }
 
