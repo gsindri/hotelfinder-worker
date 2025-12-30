@@ -531,6 +531,92 @@ function extractBadges(raw, debug = false) {
   return badges;
 }
 
+/**
+ * Extract badges from tracking/offer URL by parsing query params.
+ * This is a fallback heuristic since Google Hotels doesn't provide explicit label fields.
+ * Returns { badges: string[], debug: object } when debug=true, otherwise just badges array.
+ */
+function extractBadgesFromUrl(url, debug = false) {
+  const badges = [];
+  const debugInfo = { urlChecked: false, flagsFound: {} };
+
+  if (!url) {
+    return debug ? { badges, debug: debugInfo } : badges;
+  }
+
+  debugInfo.urlChecked = true;
+
+  try {
+    // The tracking_link often contains an encoded URL with params nested inside
+    const urlStr = String(url);
+    const lowerUrl = urlStr.toLowerCase();
+
+    // Parse the URL and any encoded URLs within it
+    const allParams = [];
+
+    // Direct URL params
+    const parsed = new URL(urlStr);
+    for (const [k, v] of parsed.searchParams) {
+      allParams.push({ key: k.toLowerCase(), value: v.toLowerCase() });
+    }
+
+    // Also check for encoded URLs in params (common pattern with tracking URLs)
+    for (const val of [parsed.searchParams.get('url'), parsed.searchParams.get('turl'), parsed.searchParams.get('dest')]) {
+      if (val) {
+        try {
+          const nested = new URL(decodeURIComponent(val));
+          for (const [k, v] of nested.searchParams) {
+            allParams.push({ key: k.toLowerCase(), value: v.toLowerCase() });
+          }
+        } catch { }
+      }
+    }
+
+    // Check for member/private rate flags
+    for (const { key, value } of allParams) {
+      // isPrivateRate=1 (Booking.com, some OTAs)
+      if (key === 'isprivaterate' && value === '1') {
+        debugInfo.flagsFound.isPrivateRate = true;
+        if (!badges.includes('Member')) badges.push('Member');
+      }
+
+      // isAudienceUser=1 (Google/Booking logged-in user prices)
+      if (key === 'isaudienceuser' && value === '1') {
+        debugInfo.flagsFound.isAudienceUser = true;
+        if (!badges.includes('Login')) badges.push('Login');
+      }
+
+      // prid containing "member" (e.g. prid=domestic_member)
+      if (key === 'prid' && /member/i.test(value)) {
+        debugInfo.flagsFound.pridMember = value;
+        if (!badges.includes('Member')) badges.push('Member');
+      }
+
+      // rateid containing "genius" or "member"
+      if (key === 'rateid' && /genius|member|vip/i.test(value)) {
+        debugInfo.flagsFound.rateIdMember = value;
+        if (!badges.includes('Member')) badges.push('Member');
+      }
+    }
+
+    // Final URL path/param string check for common patterns
+    if (/genius/i.test(lowerUrl) && !badges.includes('Member')) {
+      debugInfo.flagsFound.urlContainsGenius = true;
+      badges.push('Member');
+    }
+
+    if (/mobile[_-]?only|app[_-]?only/i.test(lowerUrl) && !badges.includes('Mobile')) {
+      debugInfo.flagsFound.urlContainsMobileOnly = true;
+      badges.push('Mobile');
+    }
+
+  } catch (e) {
+    debugInfo.parseError = e.message;
+  }
+
+  return debug ? { badges, debug: debugInfo } : badges;
+}
+
 function simplifyOffer(o, nights) {
   const link = o?.link || o?.tracking_link || null;
 
@@ -592,8 +678,8 @@ function simplifyOffer(o, nights) {
       o?.total_price?.price == null &&
       beforeTax != null,
 
-    // Badges for member/login/mobile pricing
-    badges: extractBadges(o),
+    // Badges for member/login/mobile pricing (combine label fields + URL heuristics)
+    badges: [...new Set([...extractBadges(o), ...extractBadgesFromUrl(link)])],
   };
 }
 
@@ -1619,8 +1705,13 @@ export default {
       ];
       const combinedCount = combined.length;
 
-      // Debug: capture badge extraction info for first raw offer
-      const badgeDebugInfo = debug && combined[0] ? extractBadges(combined[0], true) : null;
+      // Debug: capture badge extraction info for first raw offer (labels + URL heuristics)
+      const firstRawOffer = combined[0];
+      const firstOfferLink = firstRawOffer?.link || firstRawOffer?.tracking_link || null;
+      const badgeDebugInfo = debug && firstRawOffer ? {
+        labelExtraction: extractBadges(firstRawOffer, true),
+        urlExtraction: extractBadgesFromUrl(firstOfferLink, true),
+      } : null;
 
       // Deduplicate by source + total + link
       const seen = new Set();
