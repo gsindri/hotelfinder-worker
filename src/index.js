@@ -617,6 +617,65 @@ function extractBadgesFromUrl(url, debug = false) {
   return debug ? { badges, debug: debugInfo } : badges;
 }
 
+// --- ROOM-LEVEL PRICING (for room-aware matching) ---
+const MAX_ROOMS_PER_OFFER = 8;
+
+function simplifyRoom(r, nights) {
+  const name = r?.name || r?.room_name || r?.title || null;
+  const numGuests = r?.num_guests || null;
+
+  const totalObj = r?.total_price || r?.totalPrice || null;
+  const perNightObj = r?.price_per_night || r?.pricePerNight || null;
+
+  // Extract total price (prefer before-tax like offers)
+  const totalExtracted =
+    totalObj?.extracted_price ??
+    totalObj?.extracted_price_before_taxes ??
+    null;
+  const totalText =
+    totalObj?.price ??
+    totalObj?.price_before_taxes ??
+    null;
+  let total = totalExtracted ?? parseMoneyToNumber(totalText);
+
+  // Extract per-night price
+  const perNightExtracted =
+    perNightObj?.extracted_price ??
+    perNightObj?.extracted_price_before_taxes ??
+    null;
+  const perNightText =
+    perNightObj?.price ??
+    perNightObj?.price_before_taxes ??
+    null;
+  const perNight = perNightExtracted ?? parseMoneyToNumber(perNightText);
+
+  // Fallback: compute total from per-night * nights
+  if (total == null && perNight != null && nights) {
+    total = perNight * nights;
+  }
+
+  const link = r?.link || r?.tracking_link || null;
+
+  // Skip rooms without name or valid total
+  if (!name || total == null) return null;
+
+  return {
+    name,
+    numGuests,
+    total,
+    totalText,
+    perNight,
+    perNightText,
+    link,
+    totalIsBeforeTax: totalObj?.extracted_price == null && totalObj?.extracted_price_before_taxes != null,
+  };
+}
+
+function simplifyRooms(rooms, nights) {
+  if (!Array.isArray(rooms)) return [];
+  return rooms.slice(0, MAX_ROOMS_PER_OFFER).map(r => simplifyRoom(r, nights)).filter(Boolean);
+}
+
 function simplifyOffer(o, nights) {
   const link = o?.link || o?.tracking_link || null;
 
@@ -1281,6 +1340,7 @@ export default {
 
       const debug = url.searchParams.get("debug") === "1";
       const refresh = url.searchParams.get("refresh") === "1";
+      const includeRooms = url.searchParams.get("includeRooms") === "1"; // Enable room-level pricing
 
       const hotelName =
         url.searchParams.get("hotelName") ||
@@ -1578,7 +1638,8 @@ export default {
       // Fix: use hlCacheKey (what's actually sent to API) instead of hlKey (raw input)
       // This ensures unsupported regional variants (de-AT, de-DE) share cache when API call is identical
       const hlCacheKey = hlToSend || "nohl";
-      const offersKey = `offers:${propertyToken}:${checkIn}:${checkOut}:${adults}:${currency}:${gl}:${hlCacheKey}`;
+      const roomsCacheKey = includeRooms ? ":r1" : ""; // Version rooms data separately
+      const offersKey = `offers:${propertyToken}:${checkIn}:${checkOut}:${adults}:${currency}:${gl}:${hlCacheKey}${roomsCacheKey}`;
       const cached = (!refresh && !debug) ? await kvGetJson(env.CACHE_KV, offersKey) : null;
 
 
@@ -1730,6 +1791,12 @@ export default {
           droppedNoTotal++;
           continue;
         } // don’t include offers we can’t price
+
+        // Add room-level pricing when requested
+        if (includeRooms && Array.isArray(o.rooms) && o.rooms.length > 0) {
+          s.rooms = simplifyRooms(o.rooms, nights);
+        }
+
         simplified.push(s);
       }
 
@@ -1752,6 +1819,14 @@ export default {
         price_per_night: combined[0].price_per_night,
         link: combined[0].link,
         tracking_link: combined[0].tracking_link,
+      } : null;
+
+      // --- Debug: sample rooms (for room-aware matching) ---
+      const sampleRooms = Array.isArray(combined[0]?.rooms) ? combined[0].rooms : [];
+      const sampleRoomsDebug = debug ? {
+        roomsLen: sampleRooms.length,
+        roomKeys: sampleRooms[0] ? Object.keys(sampleRooms[0]).slice(0, 60) : [],
+        sampleRoom: sampleRooms[0] || null,
       } : null;
 
       // --- Debug: prop keys ---
@@ -1828,6 +1903,7 @@ export default {
           // --- New debug diagnostics ---
           rawCounts: rawCountsDebug,
           sampleRawOffer: sampleRawOfferDebug,
+          sampleRooms: sampleRoomsDebug, // Room-level pricing debug (for room-aware matching)
           propKeys: propKeysDebug,
           // Badge extraction debug for first raw offer
           badgeDebug: badgeDebugInfo,
