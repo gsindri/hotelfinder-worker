@@ -1493,7 +1493,7 @@ export default {
       // This ensures unsupported regional variants (de-AT, de-DE) share cache when API call is identical
       const hlCacheKey = hlToSend || "nohl";
       const offersKey = `offers:${propertyToken}:${checkIn}:${checkOut}:${adults}:${currency}:${gl}:${hlCacheKey}`;
-      const cached = !refresh ? await kvGetJson(env.CACHE_KV, offersKey) : null;
+      const cached = (!refresh && !debug) ? await kvGetJson(env.CACHE_KV, offersKey) : null;
 
 
       if (cached) {
@@ -1551,6 +1551,8 @@ export default {
             hlToSend,
             searchApi: debugSearch,
             cacheHydrated: true,
+            // Badge debug unavailable on cache hits - use debug=1 with fresh request
+            badgeDebug: { note: "Raw offers unavailable (served from cache). Cache is now bypassed when debug=1, so this should only appear if data was cached before this fix." },
           };
         }
 
