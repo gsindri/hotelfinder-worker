@@ -375,16 +375,49 @@ function scoreNameMatch(query, candidate) {
   if (!qTokens.length) return 0;
 
   let hit = 0;
-  for (const t of qTokens) if (cTokens.has(t)) hit++;
+  let firstTokenHit = false;
 
-  const coverage = hit / qTokens.length;
+  for (let i = 0; i < qTokens.length; i++) {
+    if (cTokens.has(qTokens[i])) {
+      hit++;
+      if (i === 0) firstTokenHit = true;
+    }
+  }
+
+  // First token (brand/distinctive name) is worth 2x, others worth 1x
+  const weightedHit = hit + (firstTokenHit ? 1 : 0);
+  const maxWeight = qTokens.length + 1;  // Extra 1 for first token bonus
+  let coverage = weightedHit / maxWeight;
+
+  // Penalty if missing first token (brand disambiguator) when query has 2+ tokens
+  if (qTokens.length >= 2 && !firstTokenHit) {
+    coverage = Math.max(0, coverage - 0.2);
+  }
+
   const qNorm = String(query || "").toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
   const cNorm = String(candidate || "").toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
   const containsBoost = cNorm.includes(qNorm) && qNorm.length >= 6 ? 0.25 : 0;
 
-  return coverage + containsBoost;
+  return Math.min(1, coverage + containsBoost);
 }
 
+// Extract hotel name from Booking.com URL slug
+// e.g., "/hotel/dk/comfort-hotel-copenhagen-airport.en-gb.html" → "comfort hotel copenhagen airport"
+function bookingSlugToName(bookingUrl) {
+  if (!bookingUrl) return null;
+  try {
+    const url = new URL(bookingUrl);
+    // Match /hotel/{country}/{slug}.{locale}.html or /hotel/{country}/{slug}
+    const match = url.pathname.match(/\/hotel\/[a-z]{2}\/([^/.]+)/i);
+    if (!match) return null;
+
+    // Convert slug: "comfort-hotel-copenhagen-airport" → "comfort hotel copenhagen airport"
+    return match[1]
+      .replace(/[-_]+/g, ' ')
+      .replace(/\s+/g, ' ')
+      .trim();
+  } catch { return null; }
+}
 function domainsEquivalent(a, b) {
   const da = String(a || "").toLowerCase().replace(/^www\./, "");
   const db = String(b || "").toLowerCase().replace(/^www\./, "");
@@ -1341,6 +1374,8 @@ export default {
       const debug = url.searchParams.get("debug") === "1";
       const refresh = url.searchParams.get("refresh") === "1";
       const includeRooms = url.searchParams.get("includeRooms") === "1"; // Enable room-level pricing
+      const smart = url.searchParams.get("smart") === "1";  // Smart multi-pass search mode
+      const bookingUrl = url.searchParams.get("bookingUrl") || "";  // For slug-based name extraction
 
       const hotelName =
         url.searchParams.get("hotelName") ||
@@ -1524,35 +1559,80 @@ export default {
       if (!tokenObj?.property_token) {
         tokenCacheDetail = "miss";
 
-        usage.searchapi_calls.google_hotels++; // 1 credit for google_hotels
-
-        const firstCall = await searchApiCall(env, {
-          engine: "google_hotels",
-          q: hotelName,
-          check_in_date: checkIn,
-          check_out_date: checkOut,
-          adults,
-          currency,
-          hl: hlToSend,
-          gl,
-        });
-
-        if (debugSearch) {
-          debugSearch.google_hotels = {
-            requestUrl: firstCall.requestUrl,
-            hlRaw,
-            hlNormalized,
-            hlSent,
-            hlToSend,
-            hlFallback: firstCall.hlFallback,
-            firstError: firstCall.firstError || null,
-            fetchError: firstCall.fetchError || null,
-            firstFetchError: firstCall.firstFetchError || null,
-            status: firstCall?.res?.status ?? 0,
-          };
+        // Multi-pass search (Smart Retry)
+        const queries = [hotelName];
+        if (smart) {
+          const slugName = bookingSlugToName(bookingUrl);
+          // Only add if different enough to be worth a credit
+          if (slugName && normalizeKey(slugName) !== normalizeKey(hotelName)) {
+            queries.push(slugName);
+          }
         }
 
-        const { res, data } = firstCall;
+        if (debugSearch) {
+          debugSearch.google_hotels_attempts = [];
+        }
+
+        let picked = null;
+        let props = []; // Lifted scope for debug usage
+        let finalCall = null; // { res, data, fetchError, ... }
+
+        for (let i = 0; i < queries.length; i++) {
+          const q = queries[i];
+          usage.searchapi_calls.google_hotels++;
+
+          const call = await searchApiCall(env, {
+            engine: "google_hotels",
+            q,
+            check_in_date: checkIn,
+            check_out_date: checkOut,
+            adults,
+            currency,
+            hl: hlToSend,
+            gl,
+          });
+
+          finalCall = call;
+          const { res, data } = call;
+
+          // If API failure, stop immediately (don't burn credits on broken API)
+          if (!res || !res.ok || data?.error) {
+            break;
+          }
+
+          props = data?.properties || [];
+          // Always score against the ORIGINAL hotelName and officialDomain
+          picked = pickBestProperty(props, hotelName, officialDomain);
+
+          if (debugSearch) {
+            debugSearch.google_hotels_attempts.push({
+              query: q,
+              requestUrl: call.requestUrl,
+              hl: hlToSend,
+              status: res.status,
+              bestCandidate: picked?.best?.name,
+              bestNameScore: picked?.bestNameScore,
+              bestDomainMatch: picked?.bestDomainMatch
+            });
+          }
+
+          // Acceptance criteria:
+          // 1. Domain match with decent name match (>= 0.45)
+          // 2. High name match (>= 0.70)
+          // 3. Last attempt
+          const goodEnough = (picked?.bestDomainMatch && picked?.bestNameScore >= 0.45) ||
+            (picked?.bestNameScore >= 0.70);
+
+          if (goodEnough) {
+            break;
+          }
+        }
+
+        // Handle the final result (pass or fail)
+        if (!finalCall) {
+          return jsonResponse({ error: "No search attempts made", status: 500, debug: debugSearch }, 500, corsHeaders);
+        }
+        const { res, data } = finalCall;
 
         if (!res || !res.ok || data?.error) {
           return jsonResponse(
@@ -1560,7 +1640,7 @@ export default {
               error: "SearchApi google_hotels failed",
               status: res?.status ?? 0,
               details: data?.error || data || null,
-              fetchError: firstCall.fetchError || null,
+              fetchError: finalCall.fetchError || null,
               debug: debugSearch,
             },
             502,
@@ -1568,8 +1648,7 @@ export default {
           );
         }
 
-        const props = data?.properties || [];
-        const picked = pickBestProperty(props, hotelName, officialDomain);
+        // Note: 'picked' is already calculated for the final attempt inside the loop
 
         if (!picked?.best?.property_token) {
           return jsonResponse({
@@ -1617,7 +1696,9 @@ export default {
         // Cache token to BOTH keys
         // - Name key: always cache (shorter TTL if no domain match)
         // - Domain key: cache if we have officialDomain
-        const shouldCache = tokenObj.domainMatch === true || (tokenObj.nameScore != null && tokenObj.nameScore >= 0.55);
+        // Fix: Don't cache on domainMatch alone; require nameScore >= 0.45
+        const shouldCache = (tokenObj.domainMatch === true && tokenObj.nameScore >= 0.45) ||
+          (tokenObj.nameScore != null && tokenObj.nameScore >= 0.55);
 
         if (shouldCache) {
           const nameTtl = tokenObj.domainMatch ? TOKEN_TTL_SEC : TOKEN_TTL_NO_DOMAIN_SEC;
@@ -1672,7 +1753,10 @@ export default {
             tokenKeyName,
             tokenKeyDomain: tokenKeyDomain || null,
             matchedBy: tokenObj?.domainMatch ? "officialDomain" : "name",
-            confidence: tokenObj?.domainMatch ? 0.95 : Math.max(0, Math.min(0.9, tokenObj?.nameScore || 0)),
+            matchUncertain: !(tokenObj?.domainMatch && (tokenObj?.nameScore >= 0.45)) && (tokenObj?.nameScore < 0.55),
+            confidence: tokenObj?.domainMatch
+              ? Math.max(0.5, Math.min(0.95, (tokenObj?.nameScore || 0) + 0.4))
+              : Math.min(0.9, tokenObj?.nameScore || 0),
             matchedHotelName: tokenObj?.property_name || null,
             nameScore: tokenObj?.nameScore ?? null,
             domainMatch: tokenObj?.domainMatch ?? null,
@@ -1861,7 +1945,10 @@ export default {
           tokenKeyName,
           tokenKeyDomain: tokenKeyDomain || null,
           matchedBy: tokenObj.domainMatch ? "officialDomain" : "name",
-          confidence: tokenObj.domainMatch ? 0.95 : Math.max(0, Math.min(0.9, tokenObj.nameScore || 0)),
+          matchUncertain: !(tokenObj.domainMatch && (tokenObj.nameScore >= 0.45)) && (tokenObj.nameScore < 0.55),
+          confidence: tokenObj.domainMatch
+            ? Math.max(0.5, Math.min(0.95, (tokenObj.nameScore || 0) + 0.4))
+            : Math.min(0.9, tokenObj.nameScore || 0),
           matchedHotelName: tokenObj.property_name || null,
           nameScore: tokenObj.nameScore ?? null,
           domainMatch: tokenObj.domainMatch ?? null,
