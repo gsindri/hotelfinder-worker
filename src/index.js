@@ -804,6 +804,9 @@ function simplifyRoom(r, nights) {
   // Skip rooms without name or valid total
   if (!name || total == null) return null;
 
+  // Extract badges from room link (membership flags like prid=domestic_member)
+  const badges = extractBadgesFromUrl(link);
+
   return {
     name,
     numGuests,
@@ -812,6 +815,7 @@ function simplifyRoom(r, nights) {
     perNight,
     perNightText,
     link,
+    badges: badges.length > 0 ? badges : undefined, // Only include if non-empty
     totalIsBeforeTax: totalObj?.extracted_price == null && totalObj?.extracted_price_before_taxes != null,
   };
 }
