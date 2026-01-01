@@ -369,60 +369,134 @@ function tokenizeName(s) {
     .filter((t) => t.length > 1 && !stop.has(t));
 }
 
-function scoreNameMatch(query, candidate) {
+// ---------- STRICT BRAND TOKEN PROTECTION ----------
+// These are hotel chain brand names that must match exactly.
+// If query has "comfort" and candidate has "clarion", it's a hard mismatch.
+const STRICT_BRAND_TOKENS = new Set([
+  "comfort", "clarion", "quality", "scandic", "radisson",
+  "marriott", "hilton", "hyatt", "sheraton", "westin",
+  "intercontinental", "holiday", "crowne", "indigo",
+  "novotel", "mercure", "ibis", "sofitel", "pullman",
+  "best", "western", "wyndham", "ramada", "days",
+  "motel", "travelodge", "premier", "accor", "choice",
+]);
+
+// Key location disambiguators - if query has "airport" and candidate lacks it, mismatch
+const KEY_DISAMBIGUATORS = [
+  "airport", "station", "beach", "downtown",
+  "central", "centre", "oldtown", "old town",
+  "harbor", "harbour", "city", "plaza", "grand",
+];
+
+function normalizeForIncludes(s) {
+  return String(s || "")
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, " ")
+    .trim();
+}
+
+function extractStrictBrands(name) {
+  const n = normalizeForIncludes(name);
+  const out = new Set();
+  for (const b of STRICT_BRAND_TOKENS) {
+    // word boundary match to avoid weird partials
+    if (new RegExp(`\\b${b}\\b`, "i").test(n)) out.add(b);
+  }
+  return out;
+}
+
+function extractKeyTokens(name) {
+  const n = normalizeForIncludes(name);
+  return KEY_DISAMBIGUATORS.filter(k => n.includes(k));
+}
+
+function hasAnyOverlap(setA, setB) {
+  for (const v of setA) if (setB.has(v)) return true;
+  return false;
+}
+
+// Detailed name matcher with hard mismatch detection
+function scoreNameMatchDetailed(query, candidate) {
+  const qNorm = normalizeForIncludes(query);
+  const cNorm = normalizeForIncludes(candidate);
+
+  // Strict brand check
+  const qBrands = extractStrictBrands(qNorm);
+  const cBrands = extractStrictBrands(cNorm);
+  let brandMismatch = false;
+  if (qBrands.size > 0) {
+    // Query has a brand - candidate must have at least one overlapping brand
+    brandMismatch = !hasAnyOverlap(qBrands, cBrands);
+  }
+  // Also check reverse: if candidate has a brand not in query's brands
+  if (!brandMismatch && cBrands.size > 0 && qBrands.size > 0) {
+    // Both have brands - they must overlap
+    brandMismatch = !hasAnyOverlap(qBrands, cBrands);
+  }
+
+  // Key disambiguator check
+  const qKeys = extractKeyTokens(qNorm);
+  const missingKeys = qKeys.filter(k => !cNorm.includes(k));
+  const keyMismatch = missingKeys.length > 0;
+
+  // Base token coverage (reuse tokenizeName)
   const qTokens = tokenizeName(query);
   const cTokens = new Set(tokenizeName(candidate));
-  if (!qTokens.length) return 0;
-
   let hit = 0;
-  let firstTokenHit = false;
+  for (const t of qTokens) if (cTokens.has(t)) hit++;
+  const coverage = qTokens.length ? hit / qTokens.length : 0;
 
-  for (let i = 0; i < qTokens.length; i++) {
-    if (cTokens.has(qTokens[i])) {
-      hit++;
-      if (i === 0) firstTokenHit = true;
-    }
-  }
-
-  // First token (brand/distinctive name) is worth 2x, others worth 1x
-  const weightedHit = hit + (firstTokenHit ? 1 : 0);
-  const maxWeight = qTokens.length + 1;  // Extra 1 for first token bonus
-  let coverage = weightedHit / maxWeight;
-
-  // Penalty if missing first token (brand disambiguator) when query has 2+ tokens
-  if (qTokens.length >= 2 && !firstTokenHit) {
-    coverage = Math.max(0, coverage - 0.2);
-  }
-
-  const qNorm = String(query || "").toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
-  const cNorm = String(candidate || "").toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
   const containsBoost = cNorm.includes(qNorm) && qNorm.length >= 6 ? 0.25 : 0;
+  const baseScore = coverage + containsBoost;
 
-  return Math.min(1, coverage + containsBoost);
+  const hardMismatch = brandMismatch || keyMismatch;
+
+  return {
+    hardMismatch,
+    brandMismatch,
+    keyMismatch,
+    qBrands: [...qBrands],
+    cBrands: [...cBrands],
+    missingKeys,
+    coverage,
+    containsBoost,
+    baseScore,
+  };
 }
 
-// Extract hotel name from Booking.com URL slug
-// e.g., "/hotel/dk/comfort-hotel-copenhagen-airport.en-gb.html" → "comfort hotel copenhagen airport"
-function bookingSlugToName(bookingUrl) {
-  if (!bookingUrl) return null;
-  try {
-    const url = new URL(bookingUrl);
-    // Match /hotel/{country}/{slug}.{locale}.html or /hotel/{country}/{slug}
-    const match = url.pathname.match(/\/hotel\/[a-z]{2}\/([^/.]+)/i);
-    if (!match) return null;
-
-    // Convert slug: "comfort-hotel-copenhagen-airport" → "comfort hotel copenhagen airport"
-    return match[1]
-      .replace(/[-_]+/g, ' ')
-      .replace(/\s+/g, ' ')
-      .trim();
-  } catch { return null; }
+// Legacy wrapper for places where simple score is still needed
+function scoreNameMatch(query, candidate) {
+  const detailed = scoreNameMatchDetailed(query, candidate);
+  // If hard mismatch, return 0 to prevent selection
+  if (detailed.hardMismatch) return 0;
+  return detailed.baseScore;
 }
+
 function domainsEquivalent(a, b) {
   const da = String(a || "").toLowerCase().replace(/^www\./, "");
   const db = String(b || "").toLowerCase().replace(/^www\./, "");
   if (!da || !db) return false;
   return da === db || da.endsWith("." + db) || db.endsWith("." + da);
+}
+
+// ---------- GATED DOMAIN BOOST ----------
+// Domain boost is conditional: only applied if name match is good enough
+// This prevents shared corporate domains from overriding bad name matches
+const MIN_SCORE_FOR_DOMAIN_BOOST = 0.55;
+
+function computeDomainBoost(domainMatch, baseScore) {
+  if (!domainMatch) return 0;
+  if (baseScore < MIN_SCORE_FOR_DOMAIN_BOOST) return 0;
+  // Scaled boost: helps break ties, never dominates (max ~0.7)
+  return Math.min(0.7, 0.9 * baseScore);
+}
+
+function computeConfidence(domainMatch, baseScore, hardMismatch) {
+  if (hardMismatch) return 0;
+  // Conservative: don't let domainMatch alone yield 0.95
+  let conf = Math.min(0.95, baseScore);
+  if (domainMatch && baseScore >= 0.65) conf = Math.min(0.95, conf + 0.15);
+  return Math.max(0, Math.min(0.95, conf));
 }
 
 function pickBestProperty(properties, hotelName, officialDomain) {
@@ -433,23 +507,61 @@ function pickBestProperty(properties, hotelName, officialDomain) {
   let bestNameScore = 0;
   let bestDomainMatch = false;
   let bestLinkHost = "";
+  let bestMatchDetails = null;
+  let bestConfidence = 0;
+  let allCandidates = []; // For debug
 
   for (const p of properties) {
-    const nameScore = scoreNameMatch(hotelName, p?.name || "");
+    const matchDetails = scoreNameMatchDetailed(hotelName, p?.name || "");
     const linkHost = getHostNoWww(p?.link || "");
     const domainMatch = officialDomain ? domainsEquivalent(linkHost, officialDomain) : false;
-    const score = (domainMatch ? 2.0 : 0) + nameScore;
 
-    if (score > bestScore) {
-      bestScore = score;
+    // Skip hard mismatches entirely
+    if (matchDetails.hardMismatch) {
+      allCandidates.push({
+        name: p?.name,
+        skipped: true,
+        reason: matchDetails.brandMismatch ? "brand_mismatch" : "key_mismatch",
+        details: matchDetails,
+      });
+      continue;
+    }
+
+    const domainBoost = computeDomainBoost(domainMatch, matchDetails.baseScore);
+    const finalScore = matchDetails.baseScore + domainBoost;
+    const confidence = computeConfidence(domainMatch, matchDetails.baseScore, matchDetails.hardMismatch);
+
+    allCandidates.push({
+      name: p?.name,
+      baseScore: matchDetails.baseScore,
+      domainMatch,
+      domainBoost,
+      finalScore,
+      confidence,
+      details: matchDetails,
+    });
+
+    if (finalScore > bestScore) {
+      bestScore = finalScore;
       best = p;
-      bestNameScore = nameScore;
+      bestNameScore = matchDetails.baseScore;
       bestDomainMatch = !!domainMatch;
       bestLinkHost = linkHost;
+      bestMatchDetails = matchDetails;
+      bestConfidence = confidence;
     }
   }
 
-  return { best, bestScore, bestNameScore, bestDomainMatch, bestLinkHost };
+  return {
+    best,
+    bestScore,
+    bestNameScore,
+    bestDomainMatch,
+    bestLinkHost,
+    confidence: bestConfidence,
+    matchDetails: bestMatchDetails,
+    allCandidates, // For debug output
+  };
 }
 
 function searchApiErrorText(data) {
@@ -530,14 +642,7 @@ function extractBadges(raw, debug = false) {
   ].filter(Boolean);
 
   const label = labelSources.join(' ').toLowerCase();
-
-  // Safely handle features - may be array, string, or undefined
-  const rawFeatures = raw?.features;
-  const featureParts =
-    Array.isArray(rawFeatures) ? rawFeatures :
-      (typeof rawFeatures === 'string' ? [rawFeatures] : []);
-  const features = featureParts.join(' ').toLowerCase();
-
+  const features = (raw?.features || []).join(' ').toLowerCase();
   const combined = label + ' ' + features;
 
   if (/member|loyalty|genius|vip|rewards|exclusive/i.test(combined)) badges.push('Member');
@@ -699,6 +804,9 @@ function simplifyRoom(r, nights) {
   // Skip rooms without name or valid total
   if (!name || total == null) return null;
 
+  // Extract badges from room link (membership flags like prid=domestic_member)
+  const badges = extractBadgesFromUrl(link);
+
   return {
     name,
     numGuests,
@@ -707,6 +815,7 @@ function simplifyRoom(r, nights) {
     perNight,
     perNightText,
     link,
+    badges: badges.length > 0 ? badges : undefined, // Only include if non-empty
     totalIsBeforeTax: totalObj?.extracted_price == null && totalObj?.extracted_price_before_taxes != null,
   };
 }
@@ -1381,8 +1490,6 @@ export default {
       const debug = url.searchParams.get("debug") === "1";
       const refresh = url.searchParams.get("refresh") === "1";
       const includeRooms = url.searchParams.get("includeRooms") === "1"; // Enable room-level pricing
-      const smart = url.searchParams.get("smart") === "1";  // Smart multi-pass search mode
-      const bookingUrl = url.searchParams.get("bookingUrl") || "";  // For slug-based name extraction
 
       const hotelName =
         url.searchParams.get("hotelName") ||
@@ -1487,16 +1594,17 @@ export default {
 
             // Only accept ctx token if match quality is high enough
             // This prevents garbage matches from polluting token cache
-            const CTX_MIN_NAME_SCORE = 0.35;
-            const queryTokens = tokenizeName(hotelName);
-            const acceptCtx = picked?.best?.property_token && (
-              picked.bestDomainMatch ||
-              (picked.bestNameScore >= CTX_MIN_NAME_SCORE && queryTokens.length >= 2)
-            );
+            // UPDATED: Use confidence instead of domainMatch alone
+            const CTX_MIN_CONFIDENCE = 0.55;
+            const acceptCtx = picked?.best?.property_token &&
+              picked.confidence >= CTX_MIN_CONFIDENCE &&
+              !picked.matchDetails?.hardMismatch;
 
             // Always populate ctx debug info
             ctxDebug.ctxNameScore = picked?.bestNameScore ?? null;
+            ctxDebug.ctxConfidence = picked?.confidence ?? null;
             ctxDebug.ctxMatchedProperty = picked?.best?.name || null;
+            ctxDebug.ctxMatchDetails = picked?.matchDetails || null;
 
             if (acceptCtx) {
               tokenObj = {
@@ -1508,6 +1616,7 @@ export default {
                 linkHost: getHostNoWww(picked.best.link || ""),
                 score: picked.bestScore,
                 nameScore: picked.bestNameScore,
+                confidence: picked.confidence,
                 domainMatch: picked.bestDomainMatch,
                 officialDomain: officialDomain || null,
                 fromCtx: true, // Flag that this came from context
@@ -1516,7 +1625,8 @@ export default {
               ctxDebug.ctxHit = true;
 
               // Backfill to token cache for future calls without ctx
-              const shouldBackfill = tokenObj.domainMatch || (tokenObj.nameScore >= 0.55);
+              // UPDATED: Only backfill if confidence is high (prevents cache poisoning)
+              const shouldBackfill = picked.confidence >= 0.75;
               if (shouldBackfill) {
                 ctx.waitUntil(kvPutJson(env.CACHE_KV, tokenKeyName, tokenObj, TOKEN_TTL_NO_DOMAIN_SEC));
                 if (tokenKeyDomain) {
@@ -1566,80 +1676,35 @@ export default {
       if (!tokenObj?.property_token) {
         tokenCacheDetail = "miss";
 
-        // Multi-pass search (Smart Retry)
-        const queries = [hotelName];
-        if (smart) {
-          const slugName = bookingSlugToName(bookingUrl);
-          // Only add if different enough to be worth a credit
-          if (slugName && normalizeKey(slugName) !== normalizeKey(hotelName)) {
-            queries.push(slugName);
-          }
-        }
+        usage.searchapi_calls.google_hotels++; // 1 credit for google_hotels
+
+        const firstCall = await searchApiCall(env, {
+          engine: "google_hotels",
+          q: hotelName,
+          check_in_date: checkIn,
+          check_out_date: checkOut,
+          adults,
+          currency,
+          hl: hlToSend,
+          gl,
+        });
 
         if (debugSearch) {
-          debugSearch.google_hotels_attempts = [];
+          debugSearch.google_hotels = {
+            requestUrl: firstCall.requestUrl,
+            hlRaw,
+            hlNormalized,
+            hlSent,
+            hlToSend,
+            hlFallback: firstCall.hlFallback,
+            firstError: firstCall.firstError || null,
+            fetchError: firstCall.fetchError || null,
+            firstFetchError: firstCall.firstFetchError || null,
+            status: firstCall?.res?.status ?? 0,
+          };
         }
 
-        let picked = null;
-        let props = []; // Lifted scope for debug usage
-        let finalCall = null; // { res, data, fetchError, ... }
-
-        for (let i = 0; i < queries.length; i++) {
-          const q = queries[i];
-          usage.searchapi_calls.google_hotels++;
-
-          const call = await searchApiCall(env, {
-            engine: "google_hotels",
-            q,
-            check_in_date: checkIn,
-            check_out_date: checkOut,
-            adults,
-            currency,
-            hl: hlToSend,
-            gl,
-          });
-
-          finalCall = call;
-          const { res, data } = call;
-
-          // If API failure, stop immediately (don't burn credits on broken API)
-          if (!res || !res.ok || data?.error) {
-            break;
-          }
-
-          props = data?.properties || [];
-          // Always score against the ORIGINAL hotelName and officialDomain
-          picked = pickBestProperty(props, hotelName, officialDomain);
-
-          if (debugSearch) {
-            debugSearch.google_hotels_attempts.push({
-              query: q,
-              requestUrl: call.requestUrl,
-              hl: hlToSend,
-              status: res.status,
-              bestCandidate: picked?.best?.name,
-              bestNameScore: picked?.bestNameScore,
-              bestDomainMatch: picked?.bestDomainMatch
-            });
-          }
-
-          // Acceptance criteria:
-          // 1. Domain match with decent name match (>= 0.45)
-          // 2. High name match (>= 0.70)
-          // 3. Last attempt
-          const goodEnough = (picked?.bestDomainMatch && picked?.bestNameScore >= 0.45) ||
-            (picked?.bestNameScore >= 0.70);
-
-          if (goodEnough) {
-            break;
-          }
-        }
-
-        // Handle the final result (pass or fail)
-        if (!finalCall) {
-          return jsonResponse({ error: "No search attempts made", status: 500, debug: debugSearch }, 500, corsHeaders);
-        }
-        const { res, data } = finalCall;
+        const { res, data } = firstCall;
 
         if (!res || !res.ok || data?.error) {
           return jsonResponse(
@@ -1647,7 +1712,7 @@ export default {
               error: "SearchApi google_hotels failed",
               status: res?.status ?? 0,
               details: data?.error || data || null,
-              fetchError: finalCall.fetchError || null,
+              fetchError: firstCall.fetchError || null,
               debug: debugSearch,
             },
             502,
@@ -1655,7 +1720,8 @@ export default {
           );
         }
 
-        // Note: 'picked' is already calculated for the final attempt inside the loop
+        const props = data?.properties || [];
+        const picked = pickBestProperty(props, hotelName, officialDomain);
 
         if (!picked?.best?.property_token) {
           return jsonResponse({
@@ -1678,43 +1744,29 @@ export default {
           linkHost: getHostNoWww(picked.best.link || ""),
           score: picked.bestScore,
           nameScore: picked.bestNameScore,
+          confidence: picked.confidence,
           domainMatch: picked.bestDomainMatch,
           officialDomain: officialDomain || null,
+          matchDetails: picked.matchDetails || null,
         };
 
         if (debug) {
-          candidatesDebug = (props || []).slice(0, 8).map((p) => {
-            const nameScore = scoreNameMatch(hotelName, p?.name || "");
-            const linkHost = getHostNoWww(p?.link || "");
-            const domainMatch = officialDomain ? domainsEquivalent(linkHost, officialDomain) : false;
-            const finalScore = (domainMatch ? 2.0 : 0) + nameScore;
-            return {
-              name: p?.name,
-              city: p?.city,
-              country: p?.country,
-              linkHost,
-              domainMatch,
-              nameScore,
-              finalScore,
-            };
-          });
+          // Use new detailed candidate info from pickBestProperty
+          candidatesDebug = picked.allCandidates || [];
         }
 
         // Cache token to BOTH keys
-        // - Name key: always cache (shorter TTL if no domain match)
-        // - Domain key: cache if we have officialDomain
-        // Fix: Don't cache on domainMatch alone; require nameScore >= 0.45
-        const shouldCache = (tokenObj.domainMatch === true && tokenObj.nameScore >= 0.45) ||
-          (tokenObj.nameScore != null && tokenObj.nameScore >= 0.55);
+        // UPDATED: Only cache if confidence is high enough (prevents cache poisoning)
+        const shouldCache = picked.confidence >= 0.65;
 
         if (shouldCache) {
-          const nameTtl = tokenObj.domainMatch ? TOKEN_TTL_SEC : TOKEN_TTL_NO_DOMAIN_SEC;
+          const nameTtl = picked.confidence >= 0.80 ? TOKEN_TTL_SEC : TOKEN_TTL_NO_DOMAIN_SEC;
 
           // Always write to name key
           ctx.waitUntil(kvPutJson(env.CACHE_KV, tokenKeyName, tokenObj, nameTtl));
 
-          // Also write to domain key if available (with longer TTL)
-          if (tokenKeyDomain) {
+          // Also write to domain key if available AND confidence is high
+          if (tokenKeyDomain && picked.confidence >= 0.75) {
             ctx.waitUntil(kvPutJson(env.CACHE_KV, tokenKeyDomain, tokenObj, TOKEN_TTL_SEC));
           }
         }
@@ -1760,16 +1812,17 @@ export default {
             tokenKeyName,
             tokenKeyDomain: tokenKeyDomain || null,
             matchedBy: tokenObj?.domainMatch ? "officialDomain" : "name",
-            matchUncertain: !(tokenObj?.domainMatch && (tokenObj?.nameScore >= 0.45)) && (tokenObj?.nameScore < 0.55),
-            confidence: tokenObj?.domainMatch
-              ? Math.max(0.5, Math.min(0.95, (tokenObj?.nameScore || 0) + 0.4))
-              : Math.min(0.9, tokenObj?.nameScore || 0),
+            // UPDATED: Use stored confidence instead of domainMatch->0.95 hack
+            confidence: tokenObj?.confidence ?? tokenObj?.nameScore ?? 0,
             matchedHotelName: tokenObj?.property_name || null,
             nameScore: tokenObj?.nameScore ?? null,
             domainMatch: tokenObj?.domainMatch ?? null,
             linkHost: tokenObj?.linkHost || null,
+            matchDetails: tokenObj?.matchDetails || null,
             ...ctxDebug,
           },
+          // ADDED: matchUncertain flag for UI
+          matchUncertain: (tokenObj?.confidence ?? tokenObj?.nameScore ?? 0) < 0.65,
           // Usage: 0 credits on cache hit
           usage: { searchapi_calls: { google_hotels: 0, google_hotels_property: 0 } },
         };
@@ -1952,17 +2005,18 @@ export default {
           tokenKeyName,
           tokenKeyDomain: tokenKeyDomain || null,
           matchedBy: tokenObj.domainMatch ? "officialDomain" : "name",
-          matchUncertain: !(tokenObj.domainMatch && (tokenObj.nameScore >= 0.45)) && (tokenObj.nameScore < 0.55),
-          confidence: tokenObj.domainMatch
-            ? Math.max(0.5, Math.min(0.95, (tokenObj.nameScore || 0) + 0.4))
-            : Math.min(0.9, tokenObj.nameScore || 0),
+          // UPDATED: Use stored confidence instead of domainMatch->0.95 hack
+          confidence: tokenObj.confidence ?? tokenObj.nameScore ?? 0,
           matchedHotelName: tokenObj.property_name || null,
           nameScore: tokenObj.nameScore ?? null,
           domainMatch: tokenObj.domainMatch ?? null,
           linkHost: tokenObj.linkHost || null,
+          matchDetails: tokenObj.matchDetails || null,
           // Ctx debug info: shows whether ctx was attempted and why it succeeded/failed
           ...ctxDebug,
         },
+        // ADDED: matchUncertain flag for UI - triggers "Retry match" button
+        matchUncertain: (tokenObj.confidence ?? tokenObj.nameScore ?? 0) < 0.65,
         property: {
           name: prop.name || tokenObj.property_name || hotelName,
           address: prop.address || null,
