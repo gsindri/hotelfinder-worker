@@ -642,7 +642,14 @@ function extractBadges(raw, debug = false) {
   ].filter(Boolean);
 
   const label = labelSources.join(' ').toLowerCase();
-  const features = (raw?.features || []).join(' ').toLowerCase();
+
+  // Safely handle features - may be array, string, or undefined
+  const rawFeatures = raw?.features;
+  const featureParts =
+    Array.isArray(rawFeatures) ? rawFeatures :
+      (typeof rawFeatures === 'string' ? [rawFeatures] : []);
+  const features = featureParts.join(' ').toLowerCase();
+
   const combined = label + ' ' + features;
 
   if (/member|loyalty|genius|vip|rewards|exclusive/i.test(combined)) badges.push('Member');
