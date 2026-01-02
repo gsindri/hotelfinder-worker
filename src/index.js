@@ -100,7 +100,7 @@ async function rateLimitCompare(request, env, corsHeaders) {
     const secondsIntoHour = Math.floor((now % 3600000) / 1000);
     const retryAfter = COMPARE_WINDOW_SEC - secondsIntoHour;
 
-    return new Response(JSON.stringify({ error: "Rate limit exceeded" }), {
+    return new Response(JSON.stringify({ error: "Rate limit exceeded", error_code: "RATE_LIMIT" }), {
       status: 429,
       headers: {
         "Content-Type": "application/json",
@@ -1386,11 +1386,11 @@ export default {
       if (!checkIn) missing.push("checkIn");
       if (!checkOut) missing.push("checkOut");
       if (missing.length) {
-        return jsonResponse({ error: "Missing required params", missing }, 400, prefetchHeaders);
+        return jsonResponse({ error: "Missing required params", error_code: "INVALID_PARAMS", missing }, 400, prefetchHeaders);
       }
 
       if (!isIsoDate(checkIn) || !isIsoDate(checkOut)) {
-        return jsonResponse({ error: "Dates must be YYYY-MM-DD", checkIn, checkOut }, 400, prefetchHeaders);
+        return jsonResponse({ error: "Dates must be YYYY-MM-DD", error_code: "INVALID_PARAMS", checkIn, checkOut }, 400, prefetchHeaders);
       }
 
       // Compute ctxId
@@ -1432,6 +1432,7 @@ export default {
       if (!res || !res.ok || data?.error) {
         return jsonResponse({
           error: "SearchApi google_hotels failed",
+          error_code: "SEARCH_FAILED",
           status: res?.status ?? 0,
           details: data?.error || data || null,
           fetchError: searchCall.fetchError || null,
@@ -1547,15 +1548,15 @@ export default {
       if (!hotelName) missing.push("hotelName");
       if (!checkIn) missing.push("checkIn");
       if (!checkOut) missing.push("checkOut");
-      if (missing.length) return jsonResponse({ error: "Missing required params", missing }, 400, corsHeaders);
+      if (missing.length) return jsonResponse({ error: "Missing required params", error_code: "INVALID_PARAMS", missing }, 400, corsHeaders);
 
       if (!isIsoDate(checkIn) || !isIsoDate(checkOut)) {
-        return jsonResponse({ error: "Dates must be YYYY-MM-DD", checkIn, checkOut }, 400, corsHeaders);
+        return jsonResponse({ error: "Dates must be YYYY-MM-DD", error_code: "INVALID_PARAMS", checkIn, checkOut }, 400, corsHeaders);
       }
 
       const nights = nightsBetweenIso(checkIn, checkOut);
       if (!nights || nights <= 0) {
-        return jsonResponse({ error: "Invalid date range", checkIn, checkOut }, 400, corsHeaders);
+        return jsonResponse({ error: "Invalid date range", error_code: "INVALID_PARAMS", checkIn, checkOut }, 400, corsHeaders);
       }
 
       // ---- 1) Resolve property_token (cached) ----
@@ -1641,11 +1642,11 @@ export default {
                 }
               }
             } else if (picked?.best?.property_token) {
-              // Match exists but score too low - don't use it
+              // Match exists but confidence too low - don't use it
               tokenCacheDetail = "ctx-nomatch";
-              ctxDebug.ctxRejectedReason = picked.bestNameScore < CTX_MIN_NAME_SCORE
-                ? `score_too_low:${picked.bestNameScore?.toFixed(3)}`
-                : queryTokens.length < 2 ? "query_too_short" : "unknown";
+              ctxDebug.ctxRejectedReason = picked.confidence < CTX_MIN_CONFIDENCE
+                ? `confidence_too_low:${picked.confidence?.toFixed(3)}`
+                : picked.matchDetails?.hardMismatch ? "hard_mismatch" : "unknown";
             } else {
               ctxDebug.ctxRejectedReason = "no_matching_property";
             }
@@ -1717,6 +1718,7 @@ export default {
           return jsonResponse(
             {
               error: "SearchApi google_hotels failed",
+              error_code: "SEARCH_FAILED",
               status: res?.status ?? 0,
               details: data?.error || data || null,
               fetchError: firstCall.fetchError || null,
