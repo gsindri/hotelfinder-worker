@@ -65,6 +65,73 @@ export function extractKeyTokens(name) {
     return KEY_DISAMBIGUATORS.filter(k => n.includes(k));
 }
 
+// Allowed extra tokens when matching city suffix (e.g., "London City Centre")
+const LOCATION_QUALIFIERS = new Set([
+    "city", "centre", "center", "central", "downtown", "old", "town", "historic"
+]);
+
+/**
+ * Strip trailing location suffix from query if it matches candidate's city/country.
+ * Only strips suffixes after comma or dash that match the candidate's location.
+ * Prevents false stripping (e.g., "New York" won't match "York").
+ * 
+ * @param {string} query - Original query hotel name
+ * @param {string} candidateCity - Candidate's city from SearchApi
+ * @param {string} candidateCountry - Candidate's country from SearchApi
+ * @returns {{ stripped: string, wasStripped: boolean, strippedSuffix: string }}
+ */
+export function stripTrailingLocationSuffix(query, candidateCity, candidateCountry) {
+    const original = String(query || "").trim();
+    if (!original || (!candidateCity && !candidateCountry)) {
+        return { stripped: original, wasStripped: false, strippedSuffix: "" };
+    }
+
+    // Find suffix after last comma or dash
+    const suffixMatch = original.match(/[,\-–—]\s*([^,\-–—]+)$/i);
+    if (!suffixMatch) {
+        return { stripped: original, wasStripped: false, strippedSuffix: "" };
+    }
+
+    const suffix = suffixMatch[1].trim();
+    const suffixTokens = tokenizeName(suffix);
+    if (suffixTokens.length === 0) {
+        return { stripped: original, wasStripped: false, strippedSuffix: "" };
+    }
+
+    // Try matching against city first, then country
+    for (const location of [candidateCity, candidateCountry]) {
+        if (!location) continue;
+
+        const locationTokens = new Set(tokenizeName(location));
+        if (locationTokens.size === 0) continue;
+
+        // Check if ALL suffix tokens are either:
+        // 1. Part of the location tokens, OR
+        // 2. In the allowed qualifiers list
+        let allMatch = true;
+        let hasLocationToken = false;
+
+        for (const st of suffixTokens) {
+            if (locationTokens.has(st)) {
+                hasLocationToken = true;
+            } else if (!LOCATION_QUALIFIERS.has(st)) {
+                // Found a token that's neither in location nor in qualifiers
+                allMatch = false;
+                break;
+            }
+        }
+
+        // Must have at least one actual location token (not just qualifiers)
+        // and all tokens must be accounted for
+        if (allMatch && hasLocationToken) {
+            const stripped = original.slice(0, original.length - suffixMatch[0].length).trim();
+            return { stripped, wasStripped: true, strippedSuffix: suffix };
+        }
+    }
+
+    return { stripped: original, wasStripped: false, strippedSuffix: "" };
+}
+
 /**
  * Check if two sets have any overlap.
  * @param {Set} setA - First set
@@ -109,7 +176,10 @@ export function scoreNameMatchDetailed(query, candidate) {
     for (const t of qTokens) if (cTokens.has(t)) hit++;
     const coverage = qTokens.length ? hit / qTokens.length : 0;
 
-    const containsBoost = cNorm.includes(qNorm) && qNorm.length >= 6 ? 0.25 : 0;
+    // Bidirectional contains boost: query contains candidate OR candidate contains query
+    const qContainsC = qNorm.includes(cNorm) && cNorm.length >= 6 && tokenizeName(candidate).length >= 2;
+    const cContainsQ = cNorm.includes(qNorm) && qNorm.length >= 6;
+    const containsBoost = (qContainsC || cContainsQ) ? 0.25 : 0;
     const baseScore = coverage + containsBoost;
 
     const hardMismatch = brandMismatch || keyMismatch;
@@ -198,7 +268,18 @@ export function pickBestProperty(properties, hotelName, officialDomain) {
     let allCandidates = [];
 
     for (const p of properties) {
-        const matchDetails = scoreNameMatchDetailed(hotelName, p?.name || "");
+        // Location-aware scoring: strip city suffix if it matches this candidate's city
+        const locationStrip = stripTrailingLocationSuffix(hotelName, p?.city, p?.country);
+        const queryForScore = locationStrip.stripped;
+
+        const matchDetails = scoreNameMatchDetailed(queryForScore, p?.name || "");
+
+        // Add location stripping metadata to match details
+        matchDetails.queryOriginal = hotelName;
+        matchDetails.queryForScore = queryForScore;
+        matchDetails.locationSuffixStripped = locationStrip.wasStripped;
+        matchDetails.strippedSuffix = locationStrip.strippedSuffix || null;
+
         const linkHost = getHostNoWww(p?.link || "");
         const domainMatch = officialDomain ? domainsEquivalent(linkHost, officialDomain) : false;
 
@@ -206,6 +287,7 @@ export function pickBestProperty(properties, hotelName, officialDomain) {
         if (matchDetails.hardMismatch) {
             allCandidates.push({
                 name: p?.name,
+                city: p?.city,
                 skipped: true,
                 reason: matchDetails.brandMismatch ? "brand_mismatch" : "key_mismatch",
                 details: matchDetails,
@@ -219,11 +301,13 @@ export function pickBestProperty(properties, hotelName, officialDomain) {
 
         allCandidates.push({
             name: p?.name,
+            city: p?.city,
             baseScore: matchDetails.baseScore,
             domainMatch,
             domainBoost,
             finalScore,
             confidence,
+            locationSuffixStripped: matchDetails.locationSuffixStripped,
             details: matchDetails,
         });
 

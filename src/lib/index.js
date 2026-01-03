@@ -24,7 +24,7 @@ export { getClientIp, rateLimitCompare, rateLimitPrefetch } from './rateLimit.js
 export { isIsoDate, normalizeCurrencyParam, nightsBetweenIso, normalizeHl, normalizeTravelHl, normalizeKey, parseMoneyToNumber, getHostNoWww } from './normalize.js';
 
 // Matching
-export { tokenizeName, normalizeForIncludes, extractStrictBrands, extractKeyTokens, hasAnyOverlap, scoreNameMatchDetailed, scoreNameMatch, domainsEquivalent, computeDomainBoost, computeConfidence, pickBestProperty } from './matching.js';
+export { tokenizeName, normalizeForIncludes, extractStrictBrands, extractKeyTokens, stripTrailingLocationSuffix, hasAnyOverlap, scoreNameMatchDetailed, scoreNameMatch, domainsEquivalent, computeDomainBoost, computeConfidence, pickBestProperty } from './matching.js';
 
 // SearchApi
 export { searchApiErrorText, isHlParamError, searchApiCall } from './searchApi.js';
