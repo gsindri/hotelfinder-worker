@@ -12,6 +12,11 @@ import {
     KEY_GROUP_BOOST_WEAK,
     KEY_GROUP_BOOST_CAP,
     MIN_SCORE_FOR_DOMAIN_BOOST,
+    ACCOM_TYPE_GROUPS,
+    TYPE_MATCH_BOOST,
+    TYPE_MISMATCH_PENALTY_STRONG,
+    TYPE_MISMATCH_PENALTY_WEAK,
+    TYPE_EFFECT_CAP,
 } from './constants.js';
 import { getHostNoWww } from './normalize.js';
 
@@ -149,6 +154,35 @@ function intersectSets(a, b) {
     return out;
 }
 
+// ---------- Accommodation type matching (soft boost/penalty) ----------
+
+// Precompile type matchers once at module load
+const ACCOM_TYPE_MATCHERS = ACCOM_TYPE_GROUPS.map(g => ({
+    id: g.id,
+    strength: g.strength || "weak",
+    res: (g.patterns || []).map(patternToRegex),
+}));
+
+/**
+ * Extract accommodation type groups from a name.
+ * Returns type group IDs and their strengths.
+ * @param {string} name - Hotel name
+ * @returns {{ groups: Set<string>, strengths: Object }}
+ */
+export function extractAccommodationTypeGroups(name) {
+    const n = normalizeForIncludes(name);
+    const groups = new Set();
+    const strengths = {}; // id -> "strong" | "weak"
+
+    for (const g of ACCOM_TYPE_MATCHERS) {
+        if (g.res.some(re => re.test(n))) {
+            groups.add(g.id);
+            strengths[g.id] = g.strength;
+        }
+    }
+    return { groups, strengths };
+}
+
 // Allowed extra tokens when matching city suffix (e.g., "London City Centre")
 const LOCATION_QUALIFIERS = new Set([
     "city", "centre", "center", "central", "downtown", "old", "town", "historic"
@@ -280,7 +314,41 @@ export function scoreNameMatchDetailed(query, candidate) {
     const cContainsQ = cNorm.includes(qNorm) && qNorm.length >= 6;
     const containsBoost = (qContainsC || cContainsQ) ? 0.25 : 0;
 
-    const baseScore = coverage + containsBoost + keyGroupBoost;
+    // Accommodation type signals (soft boost/penalty, never hard mismatch)
+    const qType = extractAccommodationTypeGroups(qNorm);
+    const cType = extractAccommodationTypeGroups(cNorm);
+    const qGroups = qType.groups;
+    const cGroups = cType.groups;
+
+    const typeOverlap = new Set();
+    for (const g of qGroups) if (cGroups.has(g)) typeOverlap.add(g);
+
+    let typeBoost = 0;
+    let typePenalty = 0;
+
+    if (qGroups.size > 0 && cGroups.size > 0) {
+        if (typeOverlap.size > 0) {
+            typeBoost = TYPE_MATCH_BOOST;
+        } else {
+            // Determine mismatch severity
+            const qHasStrongNonHotel = [...qGroups].some(g => qType.strengths[g] === "strong" && g !== "hotel");
+            const cHasStrongNonHotel = [...cGroups].some(g => cType.strengths[g] === "strong" && g !== "hotel");
+
+            if (qHasStrongNonHotel && cHasStrongNonHotel) {
+                typePenalty = TYPE_MISMATCH_PENALTY_STRONG;
+            } else if (qHasStrongNonHotel || cHasStrongNonHotel) {
+                typePenalty = TYPE_MISMATCH_PENALTY_WEAK;
+            }
+        }
+    }
+
+    // Cap the effect
+    typeBoost = Math.min(TYPE_EFFECT_CAP, Math.max(0, typeBoost));
+    typePenalty = Math.min(TYPE_EFFECT_CAP, Math.max(0, typePenalty));
+
+    let baseScore = coverage + containsBoost + keyGroupBoost + typeBoost - typePenalty;
+    baseScore = Math.max(0, baseScore); // Don't go negative
+
     const hardMismatch = brandMismatch || keyConflict;
 
     return {
@@ -296,6 +364,11 @@ export function scoreNameMatchDetailed(query, candidate) {
         keyOverlapAny: [...overlapAny],
         keyOverlapStrong: [...overlapStrong],
         keyGroupBoost,
+        qTypeGroups: [...qGroups],
+        cTypeGroups: [...cGroups],
+        typeOverlap: [...typeOverlap],
+        typeBoost,
+        typePenalty,
         coverage,
         containsBoost,
         baseScore,

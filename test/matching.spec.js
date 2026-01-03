@@ -334,3 +334,177 @@ describe('Synonym-aware key group matching', () => {
         });
     });
 });
+
+// ---------- Accommodation Type Signal Tests ----------
+
+// Type group rules for testing (matching constants.js)
+const TEST_ACCOM_TYPE_GROUPS = [
+    {
+        id: "apartment",
+        patterns: ["apartment", "apartments", "serviced apartment", "aparthotel", "residence"],
+        strength: "strong",
+    },
+    {
+        id: "hostel",
+        patterns: ["hostel", "youth hostel"],
+        strength: "strong",
+    },
+    {
+        id: "guesthouse",
+        patterns: ["guesthouse", "guest house", "pension"],
+        strength: "strong",
+    },
+    {
+        id: "hotel",
+        patterns: ["hotel", "inn", "lodge", "resort", "suite", "suites"],
+        strength: "weak",
+    },
+];
+
+const TYPE_MATCH_BOOST = 0.05;
+const TYPE_MISMATCH_PENALTY_STRONG = 0.18;
+const TYPE_MISMATCH_PENALTY_WEAK = 0.10;
+const TYPE_EFFECT_CAP = 0.20;
+
+// Precompile type matchers
+const TEST_ACCOM_TYPE_MATCHERS = TEST_ACCOM_TYPE_GROUPS.map(g => ({
+    id: g.id,
+    strength: g.strength || "weak",
+    res: (g.patterns || []).map(patternToRegex),
+}));
+
+function extractAccommodationTypeGroups(name) {
+    const n = normalizeForIncludes(name);
+    const groups = new Set();
+    const strengths = {};
+
+    for (const g of TEST_ACCOM_TYPE_MATCHERS) {
+        if (g.res.some(re => re.test(n))) {
+            groups.add(g.id);
+            strengths[g.id] = g.strength;
+        }
+    }
+    return { groups, strengths };
+}
+
+function computeTypePenalty(qType, cType) {
+    const qGroups = qType.groups;
+    const cGroups = cType.groups;
+
+    const typeOverlap = new Set();
+    for (const g of qGroups) if (cGroups.has(g)) typeOverlap.add(g);
+
+    if (qGroups.size === 0 || cGroups.size === 0) return 0;
+    if (typeOverlap.size > 0) return 0; // Match, no penalty
+
+    const qHasStrongNonHotel = [...qGroups].some(g => qType.strengths[g] === "strong" && g !== "hotel");
+    const cHasStrongNonHotel = [...cGroups].some(g => cType.strengths[g] === "strong" && g !== "hotel");
+
+    if (qHasStrongNonHotel && cHasStrongNonHotel) {
+        return TYPE_MISMATCH_PENALTY_STRONG;
+    } else if (qHasStrongNonHotel || cHasStrongNonHotel) {
+        return TYPE_MISMATCH_PENALTY_WEAK;
+    }
+    return 0;
+}
+
+function computeTypeBoost(qType, cType) {
+    const qGroups = qType.groups;
+    const cGroups = cType.groups;
+
+    const typeOverlap = new Set();
+    for (const g of qGroups) if (cGroups.has(g)) typeOverlap.add(g);
+
+    if (qGroups.size > 0 && cGroups.size > 0 && typeOverlap.size > 0) {
+        return TYPE_MATCH_BOOST;
+    }
+    return 0;
+}
+
+describe('Accommodation type signals', () => {
+
+    describe('extractAccommodationTypeGroups', () => {
+        it('extracts "apartment" from "Green Room Apartments"', () => {
+            const type = extractAccommodationTypeGroups("Green Room Apartments");
+            expect(type.groups.has("apartment")).toBe(true);
+            expect(type.strengths["apartment"]).toBe("strong");
+        });
+
+        it('extracts "hostel" from "Central Hostel"', () => {
+            const type = extractAccommodationTypeGroups("Central Hostel");
+            expect(type.groups.has("hostel")).toBe(true);
+            expect(type.strengths["hostel"]).toBe("strong");
+        });
+
+        it('extracts "hotel" from "Green Room Hotel"', () => {
+            const type = extractAccommodationTypeGroups("Green Room Hotel");
+            expect(type.groups.has("hotel")).toBe(true);
+            expect(type.strengths["hotel"]).toBe("weak");
+        });
+
+        it('returns empty for "Green Room" (no type)', () => {
+            const type = extractAccommodationTypeGroups("Green Room");
+            expect(type.groups.size).toBe(0);
+        });
+    });
+
+    describe('type penalty logic', () => {
+        it('1) Apartment vs Hotel = should penalize (weak penalty)', () => {
+            const qType = extractAccommodationTypeGroups("Green Room Apartments");
+            const cType = extractAccommodationTypeGroups("Green Room Hotel");
+            const penalty = computeTypePenalty(qType, cType);
+            expect(penalty).toBe(TYPE_MISMATCH_PENALTY_WEAK); // apartment(strong) vs hotel(weak)
+        });
+
+        it('2) Apartment vs Apartments = no penalty (match)', () => {
+            const qType = extractAccommodationTypeGroups("Green Room Apartments");
+            const cType = extractAccommodationTypeGroups("Green Room Apartments");
+            const penalty = computeTypePenalty(qType, cType);
+            expect(penalty).toBe(0);
+        });
+
+        it('3) Query missing type = no penalty', () => {
+            const qType = extractAccommodationTypeGroups("Green Room");
+            const cType = extractAccommodationTypeGroups("Green Room Apartments");
+            const penalty = computeTypePenalty(qType, cType);
+            expect(penalty).toBe(0); // Don't punish omission
+        });
+
+        it('4) Hostel vs Apartment = strong penalty', () => {
+            const qType = extractAccommodationTypeGroups("Central Hostel");
+            const cType = extractAccommodationTypeGroups("Central Apartments");
+            const penalty = computeTypePenalty(qType, cType);
+            expect(penalty).toBe(TYPE_MISMATCH_PENALTY_STRONG); // Both strong, no overlap
+        });
+
+        it('5) Inn vs Hotel = no penalty (both in hotel group)', () => {
+            const qType = extractAccommodationTypeGroups("Sunset Inn");
+            const cType = extractAccommodationTypeGroups("Sunset Hotel");
+            const penalty = computeTypePenalty(qType, cType);
+            expect(penalty).toBe(0); // Both map to "hotel" group
+        });
+    });
+
+    describe('type boost logic', () => {
+        it('Apartments vs Apartments = boost', () => {
+            const qType = extractAccommodationTypeGroups("Green Room Apartments");
+            const cType = extractAccommodationTypeGroups("Green Room Apartments");
+            const boost = computeTypeBoost(qType, cType);
+            expect(boost).toBe(TYPE_MATCH_BOOST);
+        });
+
+        it('Hotel vs Hotel = boost', () => {
+            const qType = extractAccommodationTypeGroups("Grand Hotel");
+            const cType = extractAccommodationTypeGroups("Grand Hotel");
+            const boost = computeTypeBoost(qType, cType);
+            expect(boost).toBe(TYPE_MATCH_BOOST);
+        });
+
+        it('No type = no boost', () => {
+            const qType = extractAccommodationTypeGroups("Green Room");
+            const cType = extractAccommodationTypeGroups("Green Room");
+            const boost = computeTypeBoost(qType, cType);
+            expect(boost).toBe(0); // Neither has type
+        });
+    });
+});

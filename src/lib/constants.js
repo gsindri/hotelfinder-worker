@@ -165,5 +165,55 @@ export const KEY_GROUP_BOOST_CAP = 0.24;    // max total boost
 // ---------- DOMAIN BOOST ----------
 export const MIN_SCORE_FOR_DOMAIN_BOOST = 0.55;
 
+// ---------- ACCOMMODATION TYPE SIGNALS ----------
+// Soft signals (boost/penalty), never hard mismatch.
+// "hotel" group is weak since names often omit "hotel" and we don't want omission to hurt.
+export const ACCOM_TYPE_GROUPS = [
+    {
+        id: "apartment",
+        patterns: [
+            "apartment", "apartments", "serviced apartment", "serviced apartments",
+            "aparthotel", "aparthotels", "residence", "residences"
+        ],
+        strength: "strong",
+    },
+    {
+        id: "hostel",
+        patterns: ["hostel", "youth hostel"],
+        strength: "strong",
+    },
+    {
+        id: "guesthouse",
+        patterns: ["guesthouse", "guest house", "pension"],
+        strength: "strong",
+    },
+    {
+        id: "bnb",
+        patterns: ["b&b", "bed and breakfast", "bed & breakfast"],
+        strength: "strong",
+    },
+    {
+        id: "villa",
+        patterns: ["villa", "villas"],
+        strength: "strong",
+    },
+    {
+        id: "motel",
+        patterns: ["motel"],
+        strength: "strong",
+    },
+    {
+        id: "hotel",
+        patterns: ["hotel", "inn", "lodge", "resort", "suite", "suites"],
+        strength: "weak", // Common + often omitted
+    },
+];
+
+// Type signal weights (tunable)
+export const TYPE_MATCH_BOOST = 0.05;               // Small bump when same type group
+export const TYPE_MISMATCH_PENALTY_STRONG = 0.18;   // apartment vs hostel, etc.
+export const TYPE_MISMATCH_PENALTY_WEAK = 0.10;     // hotel-like vs apartment-like
+export const TYPE_EFFECT_CAP = 0.20;                // Cap absolute impact
+
 // ---------- ROOM LIMIT ----------
 export const MAX_ROOMS_PER_OFFER = 8;
