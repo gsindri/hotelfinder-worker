@@ -5,7 +5,7 @@
  * @module lib/matching
  */
 
-import { STRICT_BRAND_TOKENS, KEY_DISAMBIGUATORS, MIN_SCORE_FOR_DOMAIN_BOOST } from './constants.js';
+import { STRICT_BRAND_RULES, KEY_DISAMBIGUATORS, MIN_SCORE_FOR_DOMAIN_BOOST } from './constants.js';
 import { getHostNoWww } from './normalize.js';
 
 // Stop words for name tokenization
@@ -41,16 +41,53 @@ export function normalizeForIncludes(s) {
         .trim();
 }
 
+// ---------- Phrase-aware brand matching ----------
+
 /**
- * Extract brand tokens from a name.
+ * Escape special regex characters.
+ * @param {string} s - String to escape
+ * @returns {string}
+ */
+function escapeRegExp(s) {
+    return String(s).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+/**
+ * Convert pattern string to word-boundary regex.
+ * Supports multi-word patterns with flexible whitespace.
+ * @param {string} pattern - Pattern like "best western"
+ * @returns {RegExp}
+ */
+function patternToRegex(pattern) {
+    // "best western" -> /\bbest\s+western\b/i
+    const words = normalizeForIncludes(pattern).split(/\s+/).filter(Boolean);
+    const body = words.map(escapeRegExp).join("\\s+");
+    return new RegExp(`\\b${body}\\b`, "i");
+}
+
+// Precompile brand regexes once at module load
+const STRICT_BRAND_MATCHERS = STRICT_BRAND_RULES.map(rule => ({
+    id: rule.id,
+    res: (rule.patterns || []).map(patternToRegex),
+}));
+
+/**
+ * Extract brand IDs from a name using phrase-aware matching.
+ * Returns brand IDs (not tokens) for accurate multi-word brand detection.
  * @param {string} name - Hotel name
- * @returns {Set<string>}
+ * @returns {Set<string>} Set of matched brand IDs
  */
 export function extractStrictBrands(name) {
     const n = normalizeForIncludes(name);
     const out = new Set();
-    for (const b of STRICT_BRAND_TOKENS) {
-        if (new RegExp(`\\b${b}\\b`, "i").test(n)) out.add(b);
+
+    for (const rule of STRICT_BRAND_MATCHERS) {
+        for (const re of rule.res) {
+            if (re.test(n)) {
+                out.add(rule.id);
+                break; // Only need one pattern match per brand
+            }
+        }
     }
     return out;
 }

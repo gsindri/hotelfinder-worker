@@ -91,14 +91,44 @@ export const SYMBOL_TO_ISO = {
 };
 
 // ---------- MATCHING CONSTANTS ----------
-export const STRICT_BRAND_TOKENS = new Set([
-    "comfort", "clarion", "quality", "scandic", "radisson",
-    "marriott", "hilton", "hyatt", "sheraton", "westin",
-    "intercontinental", "holiday", "crowne", "indigo",
-    "novotel", "mercure", "ibis", "sofitel", "pullman",
-    "best", "western", "wyndham", "ramada", "days",
-    "motel", "travelodge", "premier", "accor", "choice",
-]);
+// Strict brand rules with phrase patterns for accurate matching.
+// Multi-word brands (e.g., "Best Western", "Holiday Inn") are treated as phrases
+// to prevent false overlaps on generic words like "western" or "holiday".
+export const STRICT_BRAND_RULES = [
+    // Truly distinctive single-token brands
+    { id: "marriott", patterns: ["marriott"] },
+    { id: "hilton", patterns: ["hilton"] },
+    { id: "hyatt", patterns: ["hyatt"] },
+    { id: "sheraton", patterns: ["sheraton"] },
+    { id: "westin", patterns: ["westin"] },
+    { id: "radisson", patterns: ["radisson"] },
+    { id: "scandic", patterns: ["scandic"] },
+    { id: "wyndham", patterns: ["wyndham"] },
+    { id: "ramada", patterns: ["ramada"] },
+    { id: "travelodge", patterns: ["travelodge"] },
+    { id: "novotel", patterns: ["novotel"] },
+    { id: "mercure", patterns: ["mercure"] },
+    { id: "ibis", patterns: ["ibis"] },
+    { id: "sofitel", patterns: ["sofitel"] },
+    { id: "pullman", patterns: ["pullman"] },
+    { id: "intercontinental", patterns: ["intercontinental"] },
+    { id: "accor", patterns: ["accor"] },
+    { id: "clarion", patterns: ["clarion"] },
+
+    // Phrase brands (fixes "any overlap" bugs with generic words)
+    { id: "best-western", patterns: ["best western"] },
+    { id: "holiday-inn", patterns: ["holiday inn"] },
+    { id: "crowne-plaza", patterns: ["crowne plaza"] },
+    { id: "premier-inn", patterns: ["premier inn"] },
+    { id: "days-inn", patterns: ["days inn"] },
+    { id: "hotel-indigo", patterns: ["hotel indigo", "indigo hotel"] },
+    { id: "motel-6", patterns: ["motel 6", "motel six"] },
+
+    // Choice Hotels phrases (avoid generic "comfort/quality" tokens)
+    { id: "comfort-inn", patterns: ["comfort inn"] },
+    { id: "comfort-suites", patterns: ["comfort suites"] },
+    { id: "quality-inn", patterns: ["quality inn"] },
+];
 
 export const KEY_DISAMBIGUATORS = [
     "airport", "station", "beach", "downtown",
