@@ -148,3 +148,53 @@ export function getHostNoWww(s) {
         return "";
     }
 }
+
+/**
+ * Parse Booking.com hotel URL to extract country code and slug.
+ * 
+ * @example
+ * parseBookingHotelSlug("https://www.booking.com/hotel/gb/green-room-apartments.en-gb.html")
+ * // => { cc: "gb", slug: "green-room-apartments" }
+ * 
+ * @param {string} bookingUrl - Full Booking.com hotel URL
+ * @returns {{ cc: string, slug: string } | null}
+ */
+export function parseBookingHotelSlug(bookingUrl) {
+    try {
+        const u = new URL(String(bookingUrl || ""));
+        const host = u.hostname.toLowerCase().replace(/^www\./, "");
+
+        // Must be booking.com or subdomain (e.g., secure.booking.com)
+        if (host !== "booking.com" && !host.endsWith(".booking.com")) {
+            return null;
+        }
+
+        // Match /hotel/{cc}/{tail}
+        const m = u.pathname.match(/^\/hotel\/([a-z]{2})\/([^/?#]+)$/i);
+        if (!m) return null;
+
+        const cc = m[1].toLowerCase();
+        let tail = m[2];
+
+        // Strip .html or .htm extension
+        tail = tail.replace(/\.html?$/i, "");
+
+        // Strip language suffix at end: .en-gb, .en, .de-at, etc.
+        tail = tail.replace(/\.[a-z]{2}(?:-[a-z]{2})?$/i, "");
+
+        // URL decode and normalize
+        tail = decodeURIComponent(tail).toLowerCase();
+
+        // Normalize: keep only alphanumeric and hyphens
+        const slug = tail
+            .replace(/[^a-z0-9-]+/g, "-")
+            .replace(/-+/g, "-")
+            .replace(/^-|-$/g, "");
+
+        if (!slug) return null;
+
+        return { cc, slug };
+    } catch {
+        return null;
+    }
+}

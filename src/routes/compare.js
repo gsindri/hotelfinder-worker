@@ -21,6 +21,7 @@ import {
     normalizeKey,
     nightsBetweenIso,
     getHostNoWww,
+    parseBookingHotelSlug,
 } from '../lib/normalize.js';
 import { pickBestProperty, validateCachedToken } from '../lib/matching.js';
 import { searchApiCall } from '../lib/searchApi.js';
@@ -69,6 +70,11 @@ export async function handleCompare({ request, env, ctx, url, corsHeaders, compa
     const debug = url.searchParams.get("debug") === "1";
     const refresh = url.searchParams.get("refresh") === "1";
     const includeRooms = url.searchParams.get("includeRooms") === "1";
+
+    // Smart matching: Booking URL slug
+    const smartRaw = url.searchParams.get("smart");
+    const smart = smartRaw === "1" || smartRaw === "true";
+    const bookingUrlRaw = url.searchParams.get("bookingUrl") || "";
 
     const hotelName =
         url.searchParams.get("hotelName") ||
@@ -135,6 +141,12 @@ export async function handleCompare({ request, env, ctx, url, corsHeaders, compa
     const tokenKeyDomain = domainIdentity ? `tok:${gl}:${domainIdentity}` : null;
     const tokenKey = tokenKeyDomain || tokenKeyName;
 
+    // Booking slug identity (stable across name variations)
+    const bookingParsed = smart ? parseBookingHotelSlug(bookingUrlRaw) : null;
+    const bookingSlug = bookingParsed?.slug || "";
+    const bookingIdentity = bookingSlug ? `b:${bookingSlug}` : null;
+    const tokenKeyBooking = bookingIdentity ? `tok:${gl}:${bookingIdentity}` : null;
+
     let tokenCacheDetail = "miss";
 
     const ctxParam = url.searchParams.get("ctx") || "";
@@ -159,7 +171,9 @@ export async function handleCompare({ request, env, ctx, url, corsHeaders, compa
             } else if (!Array.isArray(ctxData.properties) || ctxData.properties.length === 0) {
                 ctxDebug.ctxRejectedReason = "ctx_empty";
             } else {
-                const picked = pickBestProperty(ctxData.properties, hotelName, officialDomain);
+                // Derive altQuery from booking slug for improved matching
+                const altQuery = bookingSlug ? bookingSlug.replace(/-/g, " ") : "";
+                const picked = pickBestProperty(ctxData.properties, hotelName, officialDomain, { altQuery });
 
                 const CTX_MIN_CONFIDENCE = 0.55;
                 const acceptCtx = picked?.best?.property_token &&
@@ -195,6 +209,9 @@ export async function handleCompare({ request, env, ctx, url, corsHeaders, compa
                         if (tokenKeyDomain) {
                             ctx.waitUntil(kvPutJson(env.CACHE_KV, tokenKeyDomain, tokenObj, TOKEN_TTL_SEC));
                         }
+                        if (tokenKeyBooking) {
+                            ctx.waitUntil(kvPutJson(env.CACHE_KV, tokenKeyBooking, tokenObj, TOKEN_TTL_NO_DOMAIN_SEC));
+                        }
                     }
                 } else if (picked?.best?.property_token) {
                     tokenCacheDetail = "ctx-nomatch";
@@ -220,6 +237,23 @@ export async function handleCompare({ request, env, ctx, url, corsHeaders, compa
                 } else {
                     Object.assign(tokenObj, v.updates);
                     tokenCacheDetail = "hit-domain";
+                }
+            }
+        }
+
+        // 2.5) Try booking slug key (stable across name variations)
+        if (!tokenObj?.property_token && tokenKeyBooking) {
+            tokenObj = await kvGetJson(env.CACHE_KV, tokenKeyBooking);
+            if (tokenObj?.property_token) {
+                // Validate like hit-name (same thresholds)
+                const v = validateCachedToken({ hotelName, officialDomain, tokenObj, source: "hit-booking" });
+                tokenValidation = { source: "hit-booking", ...v };
+                if (!v.ok) {
+                    tokenObj = null;
+                    tokenCacheDetail = `invalid-hit-booking:${v.reason}`;
+                } else {
+                    Object.assign(tokenObj, v.updates);
+                    tokenCacheDetail = "hit-booking";
                 }
             }
         }
@@ -300,7 +334,10 @@ export async function handleCompare({ request, env, ctx, url, corsHeaders, compa
         }
 
         const props = data?.properties || [];
-        const picked = pickBestProperty(props, hotelName, officialDomain);
+
+        // Derive altQuery from booking slug for improved matching
+        const altQuery = bookingSlug ? bookingSlug.replace(/-/g, " ") : "";
+        const picked = pickBestProperty(props, hotelName, officialDomain, { altQuery });
 
         if (!picked?.best?.property_token) {
             return jsonResponse({
@@ -342,6 +379,11 @@ export async function handleCompare({ request, env, ctx, url, corsHeaders, compa
 
             if (tokenKeyDomain && picked.confidence >= 0.75) {
                 ctx.waitUntil(kvPutJson(env.CACHE_KV, tokenKeyDomain, tokenObj, TOKEN_TTL_SEC));
+            }
+
+            // Cache under booking slug key with slightly lower threshold
+            if (tokenKeyBooking && picked.confidence >= 0.70) {
+                ctx.waitUntil(kvPutJson(env.CACHE_KV, tokenKeyBooking, tokenObj, TOKEN_TTL_NO_DOMAIN_SEC));
             }
         }
     }
@@ -597,6 +639,11 @@ export async function handleCompare({ request, env, ctx, url, corsHeaders, compa
             officialUrl: officialUrl || null,
             officialDomain: officialDomain || null,
             currentHost: currentHost || null,
+            // Booking smart matching debug
+            smart,
+            bookingUrl: bookingUrlRaw || null,
+            bookingSlug: bookingSlug || null,
+            tokenKeyBooking: tokenKeyBooking || null,
             hlRaw,
             hlNormalized,
             hlSent,

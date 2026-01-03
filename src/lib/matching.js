@@ -347,10 +347,14 @@ export function validateCachedToken({ hotelName, officialDomain, tokenObj, sourc
  * @param {Object[]} properties - Candidate properties
  * @param {string} hotelName - Query hotel name
  * @param {string} officialDomain - Official domain for boost
+ * @param {Object} [opts] - Options
+ * @param {string} [opts.altQuery] - Alternative query for score boosting (e.g., from Booking slug)
  * @returns {Object|null}
  */
-export function pickBestProperty(properties, hotelName, officialDomain) {
+export function pickBestProperty(properties, hotelName, officialDomain, opts = {}) {
     if (!Array.isArray(properties) || properties.length === 0) return null;
+
+    const altQuery = String(opts.altQuery || "").trim();
 
     let best = null;
     let bestScore = -1;
@@ -377,7 +381,7 @@ export function pickBestProperty(properties, hotelName, officialDomain) {
         const linkHost = getHostNoWww(p?.link || "");
         const domainMatch = officialDomain ? domainsEquivalent(linkHost, officialDomain) : false;
 
-        // Skip hard mismatches
+        // Skip hard mismatches (main query determines this, not altQuery)
         if (matchDetails.hardMismatch) {
             allCandidates.push({
                 name: p?.name,
@@ -389,14 +393,38 @@ export function pickBestProperty(properties, hotelName, officialDomain) {
             continue;
         }
 
-        const domainBoost = computeDomainBoost(domainMatch, matchDetails.baseScore);
-        const finalScore = matchDetails.baseScore + domainBoost;
-        const confidence = computeConfidence(domainMatch, matchDetails.baseScore, matchDetails.hardMismatch);
+        // altQuery scoring: can only IMPROVE baseScore, never bypass hardMismatch
+        let baseScore = matchDetails.baseScore;
+        let altUsed = false;
+        let altBaseScore = null;
+
+        if (altQuery) {
+            const alt = scoreNameMatchDetailed(altQuery, p?.name || "");
+            altBaseScore = alt.baseScore;
+            // Only use alt if it improves score AND doesn't have its own hardMismatch
+            if (!alt.hardMismatch && alt.baseScore > baseScore) {
+                baseScore = alt.baseScore;
+                altUsed = true;
+            }
+        }
+
+        matchDetails.altQuery = altQuery || null;
+        matchDetails.altUsed = altUsed;
+        matchDetails.altBaseScore = altBaseScore;
+        matchDetails.mainBaseScore = matchDetails.baseScore;
+        matchDetails.effectiveBaseScore = baseScore;
+
+        const domainBoost = computeDomainBoost(domainMatch, baseScore);
+        const finalScore = baseScore + domainBoost;
+        const confidence = computeConfidence(domainMatch, baseScore, matchDetails.hardMismatch);
 
         allCandidates.push({
             name: p?.name,
             city: p?.city,
-            baseScore: matchDetails.baseScore,
+            baseScore,
+            mainBaseScore: matchDetails.baseScore,
+            altBaseScore,
+            altUsed,
             domainMatch,
             domainBoost,
             finalScore,
@@ -408,7 +436,7 @@ export function pickBestProperty(properties, hotelName, officialDomain) {
         if (finalScore > bestScore) {
             bestScore = finalScore;
             best = p;
-            bestNameScore = matchDetails.baseScore;
+            bestNameScore = baseScore;
             bestDomainMatch = !!domainMatch;
             bestLinkHost = linkHost;
             bestMatchDetails = matchDetails;
