@@ -145,3 +145,192 @@ describe('Phrase-aware brand matching', () => {
         });
     });
 });
+
+// ---------- Key Group Synonym Matching Tests ----------
+
+// Key group rules for testing (matching constants.js)
+const TEST_KEY_GROUP_RULES = [
+    {
+        id: "airport",
+        strong: ["airport", "terminal"],
+        weak: [],
+    },
+    {
+        id: "station",
+        strong: ["train station", "railway station", "metro station", "subway station"],
+        weak: ["station"],
+    },
+    {
+        id: "center",
+        strong: ["downtown", "city center", "city centre", "old town", "oldtown", "historic center", "historic centre"],
+        weak: ["central", "centre"],
+    },
+    {
+        id: "waterfront",
+        strong: ["beach", "seafront", "oceanfront", "waterfront", "beachfront"],
+        weak: ["harbor", "harbour", "marina", "port"],
+    },
+];
+
+const KEY_GROUP_BOOST_STRONG = 0.12;
+const KEY_GROUP_BOOST_WEAK = 0.06;
+const KEY_GROUP_BOOST_CAP = 0.24;
+
+// Precompile key group matchers
+const TEST_KEY_GROUP_MATCHERS = TEST_KEY_GROUP_RULES.map(g => ({
+    id: g.id,
+    strong: (g.strong || []).map(patternToRegex),
+    weak: (g.weak || []).map(patternToRegex),
+}));
+
+function extractKeySignals(name) {
+    const n = normalizeForIncludes(name);
+    const strong = new Set();
+    const weak = new Set();
+    const matched = {};
+
+    for (const g of TEST_KEY_GROUP_MATCHERS) {
+        const isStrong = g.strong.some(re => re.test(n));
+        if (isStrong) {
+            strong.add(g.id);
+            matched[g.id] = "strong";
+            continue;
+        }
+        const isWeak = g.weak.some(re => re.test(n));
+        if (isWeak) {
+            weak.add(g.id);
+            matched[g.id] = "weak";
+        }
+    }
+    return { strong, weak, matched };
+}
+
+function unionSets(a, b) {
+    const out = new Set(a);
+    for (const v of b) out.add(v);
+    return out;
+}
+
+function intersectSets(a, b) {
+    const out = new Set();
+    for (const v of a) if (b.has(v)) out.add(v);
+    return out;
+}
+
+function computeKeyConflict(qKey, cKey) {
+    const overlapStrong = intersectSets(qKey.strong, cKey.strong);
+    return qKey.strong.size > 0 && cKey.strong.size > 0 && overlapStrong.size === 0;
+}
+
+function computeKeyGroupBoost(qKey, cKey) {
+    const qAny = unionSets(qKey.strong, qKey.weak);
+    const cAny = unionSets(cKey.strong, cKey.weak);
+    const overlapAny = intersectSets(qAny, cAny);
+
+    let boost = 0;
+    for (const gid of overlapAny) {
+        const bothStrong = qKey.strong.has(gid) && cKey.strong.has(gid);
+        boost += bothStrong ? KEY_GROUP_BOOST_STRONG : KEY_GROUP_BOOST_WEAK;
+    }
+    return Math.min(KEY_GROUP_BOOST_CAP, boost);
+}
+
+describe('Synonym-aware key group matching', () => {
+
+    describe('extractKeySignals', () => {
+        it('extracts "center" from "Hotel Foo Downtown"', () => {
+            const signals = extractKeySignals("Hotel Foo Downtown");
+            expect(signals.strong.has("center")).toBe(true);
+            expect(signals.matched["center"]).toBe("strong");
+        });
+
+        it('extracts "center" from "Hotel Foo City Centre"', () => {
+            const signals = extractKeySignals("Hotel Foo City Centre");
+            expect(signals.strong.has("center")).toBe(true);
+        });
+
+        it('extracts weak "center" from "Hotel Foo Central"', () => {
+            const signals = extractKeySignals("Hotel Foo Central");
+            expect(signals.weak.has("center")).toBe(true);
+            expect(signals.strong.has("center")).toBe(false);
+        });
+
+        it('extracts "airport" from "Hotel Foo Airport"', () => {
+            const signals = extractKeySignals("Hotel Foo Airport");
+            expect(signals.strong.has("airport")).toBe(true);
+        });
+
+        it('returns empty for "Hotel Foo" (no key signals)', () => {
+            const signals = extractKeySignals("Hotel Foo");
+            expect(signals.strong.size).toBe(0);
+            expect(signals.weak.size).toBe(0);
+        });
+    });
+
+    describe('keyConflict logic', () => {
+        it('A) Synonym equivalence: Downtown vs City Centre = NO conflict', () => {
+            const qKey = extractKeySignals("Hotel Foo Downtown");
+            const cKey = extractKeySignals("Hotel Foo City Centre");
+            const keyConflict = computeKeyConflict(qKey, cKey);
+            expect(keyConflict).toBe(false); // Both have "center" strong
+        });
+
+        it('B) Strong conflict: Airport vs Downtown = conflict', () => {
+            const qKey = extractKeySignals("Hotel Foo Airport");
+            const cKey = extractKeySignals("Hotel Foo Downtown");
+            const keyConflict = computeKeyConflict(qKey, cKey);
+            expect(keyConflict).toBe(true); // Both have strong, no overlap
+        });
+
+        it('C) Missing keys = soft (no conflict)', () => {
+            const qKey = extractKeySignals("Hotel Foo Airport");
+            const cKey = extractKeySignals("Hotel Foo");
+            const keyConflict = computeKeyConflict(qKey, cKey);
+            expect(keyConflict).toBe(false); // Candidate has no strong keys
+        });
+
+        it('D) Weak tokens don\'t create conflicts', () => {
+            const qKey = extractKeySignals("Hotel Foo Airport");
+            const cKey = extractKeySignals("Hotel Foo Central"); // weak center
+            const keyConflict = computeKeyConflict(qKey, cKey);
+            expect(keyConflict).toBe(false); // Candidate has only weak, no conflict
+        });
+
+        it('E) Grand/Plaza/City (generic words) don\'t act as disambiguators', () => {
+            const signals = extractKeySignals("Grand Plaza Hotel Foo");
+            // These generic words should NOT trigger any key group
+            expect(signals.strong.size).toBe(0);
+            expect(signals.weak.size).toBe(0);
+        });
+    });
+
+    describe('keyGroupBoost', () => {
+        it('Downtown vs City Centre = positive boost', () => {
+            const qKey = extractKeySignals("Hotel Foo Downtown");
+            const cKey = extractKeySignals("Hotel Foo City Centre");
+            const boost = computeKeyGroupBoost(qKey, cKey);
+            expect(boost).toBe(KEY_GROUP_BOOST_STRONG); // Both strong
+        });
+
+        it('Downtown vs Central = weaker boost', () => {
+            const qKey = extractKeySignals("Hotel Foo Downtown");
+            const cKey = extractKeySignals("Hotel Foo Central");
+            const boost = computeKeyGroupBoost(qKey, cKey);
+            expect(boost).toBe(KEY_GROUP_BOOST_WEAK); // One weak
+        });
+
+        it('Airport vs Downtown = no boost (different groups)', () => {
+            const qKey = extractKeySignals("Hotel Foo Airport");
+            const cKey = extractKeySignals("Hotel Foo Downtown");
+            const boost = computeKeyGroupBoost(qKey, cKey);
+            expect(boost).toBe(0);
+        });
+
+        it('No keys = no boost', () => {
+            const qKey = extractKeySignals("Hotel Foo");
+            const cKey = extractKeySignals("Hotel Bar");
+            const boost = computeKeyGroupBoost(qKey, cKey);
+            expect(boost).toBe(0);
+        });
+    });
+});

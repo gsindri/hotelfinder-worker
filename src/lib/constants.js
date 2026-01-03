@@ -130,11 +130,37 @@ export const STRICT_BRAND_RULES = [
     { id: "quality-inn", patterns: ["quality inn"] },
 ];
 
-export const KEY_DISAMBIGUATORS = [
-    "airport", "station", "beach", "downtown",
-    "central", "centre", "oldtown", "old town",
-    "harbor", "harbour", "city", "plaza", "grand",
+// ---------- KEY DISAMBIGUATOR GROUPS (synonym-aware) ----------
+// "Strong" patterns are location-defining (trigger conflicts if mismatched).
+// "Weak" patterns are ambiguous (contribute to boost but not conflict).
+// Removed generic words like "city", "plaza", "grand" that caused false mismatches.
+export const KEY_GROUP_RULES = [
+    {
+        id: "airport",
+        strong: ["airport", "terminal"],
+        weak: [],
+    },
+    {
+        id: "station",
+        strong: ["train station", "railway station", "metro station", "subway station"],
+        weak: ["station"], // "station" alone is often ambiguous
+    },
+    {
+        id: "center",
+        strong: ["downtown", "city center", "city centre", "old town", "oldtown", "historic center", "historic centre"],
+        weak: ["central", "centre"], // can appear in non-location contexts
+    },
+    {
+        id: "waterfront",
+        strong: ["beach", "seafront", "oceanfront", "waterfront", "beachfront"],
+        weak: ["harbor", "harbour", "marina", "port"],
+    },
 ];
+
+// Boost when query+candidate share a key-group (helps "downtown" vs "city centre")
+export const KEY_GROUP_BOOST_STRONG = 0.12; // both sides strong
+export const KEY_GROUP_BOOST_WEAK = 0.06;   // at least one side weak
+export const KEY_GROUP_BOOST_CAP = 0.24;    // max total boost
 
 // ---------- DOMAIN BOOST ----------
 export const MIN_SCORE_FOR_DOMAIN_BOOST = 0.55;

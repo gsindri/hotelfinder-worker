@@ -5,7 +5,14 @@
  * @module lib/matching
  */
 
-import { STRICT_BRAND_RULES, KEY_DISAMBIGUATORS, MIN_SCORE_FOR_DOMAIN_BOOST } from './constants.js';
+import {
+    STRICT_BRAND_RULES,
+    KEY_GROUP_RULES,
+    KEY_GROUP_BOOST_STRONG,
+    KEY_GROUP_BOOST_WEAK,
+    KEY_GROUP_BOOST_CAP,
+    MIN_SCORE_FOR_DOMAIN_BOOST,
+} from './constants.js';
 import { getHostNoWww } from './normalize.js';
 
 // Stop words for name tokenization
@@ -92,14 +99,54 @@ export function extractStrictBrands(name) {
     return out;
 }
 
+// ---------- Synonym-aware key group matching ----------
+
+// Precompile key group matchers once at module load
+const KEY_GROUP_MATCHERS = KEY_GROUP_RULES.map(g => ({
+    id: g.id,
+    strong: (g.strong || []).map(patternToRegex),
+    weak: (g.weak || []).map(patternToRegex),
+}));
+
 /**
- * Extract key disambiguator tokens from a name.
+ * Extract key group signals from a name using phrase-aware matching.
+ * Returns strong and weak signal sets for conflict detection and boosting.
  * @param {string} name - Hotel name
- * @returns {string[]}
+ * @returns {{ strong: Set<string>, weak: Set<string>, matched: Object }}
  */
-export function extractKeyTokens(name) {
+export function extractKeySignals(name) {
     const n = normalizeForIncludes(name);
-    return KEY_DISAMBIGUATORS.filter(k => n.includes(k));
+    const strong = new Set();
+    const weak = new Set();
+    const matched = {}; // id -> "strong" | "weak"
+
+    for (const g of KEY_GROUP_MATCHERS) {
+        const isStrong = g.strong.some(re => re.test(n));
+        if (isStrong) {
+            strong.add(g.id);
+            matched[g.id] = "strong";
+            continue;
+        }
+        const isWeak = g.weak.some(re => re.test(n));
+        if (isWeak) {
+            weak.add(g.id);
+            matched[g.id] = "weak";
+        }
+    }
+    return { strong, weak, matched };
+}
+
+// Set helpers for key group logic
+function unionSets(a, b) {
+    const out = new Set(a);
+    for (const v of b) out.add(v);
+    return out;
+}
+
+function intersectSets(a, b) {
+    const out = new Set();
+    for (const v of a) if (b.has(v)) out.add(v);
+    return out;
 }
 
 // Allowed extra tokens when matching city suffix (e.g., "London City Centre")
@@ -197,14 +244,29 @@ export function scoreNameMatchDetailed(query, candidate) {
     if (qBrands.size > 0) {
         brandMismatch = !hasAnyOverlap(qBrands, cBrands);
     }
-    if (!brandMismatch && cBrands.size > 0 && qBrands.size > 0) {
-        brandMismatch = !hasAnyOverlap(qBrands, cBrands);
-    }
 
-    // Key disambiguator check
-    const qKeys = extractKeyTokens(qNorm);
-    const missingKeys = qKeys.filter(k => !cNorm.includes(k));
-    const keyMismatch = missingKeys.length > 0;
+    // Key group extraction (synonym-aware)
+    const qKey = extractKeySignals(qNorm);
+    const cKey = extractKeySignals(cNorm);
+
+    // Conflict uses STRONG patterns only (prevents ambiguous words from causing hard reject)
+    const overlapStrong = intersectSets(qKey.strong, cKey.strong);
+    const keyConflict =
+        qKey.strong.size > 0 &&
+        cKey.strong.size > 0 &&
+        overlapStrong.size === 0;
+
+    // Overlap boost uses STRONG+WEAK union (helps "downtown" vs "central/centre")
+    const qAny = unionSets(qKey.strong, qKey.weak);
+    const cAny = unionSets(cKey.strong, cKey.weak);
+    const overlapAny = intersectSets(qAny, cAny);
+
+    let keyGroupBoost = 0;
+    for (const gid of overlapAny) {
+        const bothStrong = qKey.strong.has(gid) && cKey.strong.has(gid);
+        keyGroupBoost += bothStrong ? KEY_GROUP_BOOST_STRONG : KEY_GROUP_BOOST_WEAK;
+    }
+    keyGroupBoost = Math.min(KEY_GROUP_BOOST_CAP, keyGroupBoost);
 
     // Base token coverage
     const qTokens = tokenizeName(query);
@@ -217,17 +279,23 @@ export function scoreNameMatchDetailed(query, candidate) {
     const qContainsC = qNorm.includes(cNorm) && cNorm.length >= 6 && tokenizeName(candidate).length >= 2;
     const cContainsQ = cNorm.includes(qNorm) && qNorm.length >= 6;
     const containsBoost = (qContainsC || cContainsQ) ? 0.25 : 0;
-    const baseScore = coverage + containsBoost;
 
-    const hardMismatch = brandMismatch || keyMismatch;
+    const baseScore = coverage + containsBoost + keyGroupBoost;
+    const hardMismatch = brandMismatch || keyConflict;
 
     return {
         hardMismatch,
         brandMismatch,
-        keyMismatch,
+        keyConflict,
         qBrands: [...qBrands],
         cBrands: [...cBrands],
-        missingKeys,
+        qKeyStrong: [...qKey.strong],
+        qKeyWeak: [...qKey.weak],
+        cKeyStrong: [...cKey.strong],
+        cKeyWeak: [...cKey.weak],
+        keyOverlapAny: [...overlapAny],
+        keyOverlapStrong: [...overlapStrong],
+        keyGroupBoost,
         coverage,
         containsBoost,
         baseScore,
@@ -424,7 +492,7 @@ export function pickBestProperty(properties, hotelName, officialDomain, opts = {
                 name: p?.name,
                 city: p?.city,
                 skipped: true,
-                reason: matchDetails.brandMismatch ? "brand_mismatch" : "key_mismatch",
+                reason: matchDetails.brandMismatch ? "brand_mismatch" : matchDetails.keyConflict ? "key_conflict" : "hard_mismatch",
                 details: matchDetails,
             });
             continue;
