@@ -249,6 +249,100 @@ export function computeConfidence(domainMatch, baseScore, hardMismatch) {
 }
 
 /**
+ * Validate a cached token against the current query.
+ * Re-scores using current matching logic to detect stale/wrong cache entries.
+ * 
+ * @param {Object} params
+ * @param {string} params.hotelName - Current query hotel name
+ * @param {string} params.officialDomain - Current official domain (if any)
+ * @param {Object} params.tokenObj - Cached token object from KV
+ * @param {string} params.source - Cache source ("hit-domain", "hit-name", "ctx-hit")
+ * @returns {Object} Validation result with ok, reason, updates, confidence, etc.
+ */
+export function validateCachedToken({ hotelName, officialDomain, tokenObj, source }) {
+    const candidateName = tokenObj?.property_name || "";
+    if (!candidateName) {
+        return { ok: false, reason: "missing_property_name" };
+    }
+
+    // Ensure linkHost available
+    const linkHost = tokenObj?.linkHost || getHostNoWww(tokenObj?.link || "");
+    const domainMatch = officialDomain ? domainsEquivalent(linkHost, officialDomain) : false;
+
+    // Use city suffix stripping consistent with pickBestProperty
+    const locationStrip = stripTrailingLocationSuffix(hotelName, tokenObj?.city, tokenObj?.country);
+    const queryForScore = locationStrip.stripped;
+
+    const details = scoreNameMatchDetailed(queryForScore, candidateName);
+    details.queryOriginal = hotelName;
+    details.queryForScore = queryForScore;
+    details.locationSuffixStripped = locationStrip.wasStripped;
+
+    const baseScore = details.baseScore;
+    const confidence = computeConfidence(domainMatch, baseScore, details.hardMismatch);
+
+    // Validation thresholds:
+    // - Always reject hardMismatch
+    if (details.hardMismatch) {
+        return {
+            ok: false,
+            reason: "hard_mismatch",
+            details,
+            confidence,
+            baseScore,
+            domainMatch,
+            queryForScore
+        };
+    }
+
+    // - For hit-domain, still require some baseScore to avoid chain-domain collisions
+    if (source === "hit-domain") {
+        if (baseScore < MIN_SCORE_FOR_DOMAIN_BOOST) {
+            return {
+                ok: false,
+                reason: `domain_hit_but_name_too_low:${baseScore.toFixed(3)}`,
+                details,
+                confidence,
+                baseScore,
+                domainMatch,
+                queryForScore
+            };
+        }
+    } else {
+        // hit-name or ctx-hit: require at least the ctx threshold
+        if (confidence < 0.55) {
+            return {
+                ok: false,
+                reason: `confidence_too_low:${confidence.toFixed(3)}`,
+                details,
+                confidence,
+                baseScore,
+                domainMatch,
+                queryForScore
+            };
+        }
+    }
+
+    // Validation passed - return freshened fields
+    return {
+        ok: true,
+        updates: {
+            linkHost,
+            nameScore: baseScore,
+            confidence,
+            domainMatch,
+            matchDetails: details,
+            officialDomain: officialDomain || null,
+        },
+        confidence,
+        baseScore,
+        domainMatch,
+        queryForScore,
+        details,
+    };
+}
+
+/**
  * Pick best property from candidates.
  * @param {Object[]} properties - Candidate properties
  * @param {string} hotelName - Query hotel name

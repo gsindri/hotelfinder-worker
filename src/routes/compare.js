@@ -22,7 +22,7 @@ import {
     nightsBetweenIso,
     getHostNoWww,
 } from '../lib/normalize.js';
-import { pickBestProperty } from '../lib/matching.js';
+import { pickBestProperty, validateCachedToken } from '../lib/matching.js';
 import { searchApiCall } from '../lib/searchApi.js';
 import {
     extractBadges,
@@ -148,6 +148,7 @@ export async function handleCompare({ request, env, ctx, url, corsHeaders, compa
     };
 
     let tokenObj = null;
+    let tokenValidation = null; // Debug info for cache validation
     if (!refresh) {
         // 1) Try search context first (from /prefetchCtx)
         if (ctxKey) {
@@ -210,7 +211,16 @@ export async function handleCompare({ request, env, ctx, url, corsHeaders, compa
         if (!tokenObj?.property_token && tokenKeyDomain) {
             tokenObj = await kvGetJson(env.CACHE_KV, tokenKeyDomain);
             if (tokenObj?.property_token) {
-                tokenCacheDetail = "hit-domain";
+                // Validate cached token against current query
+                const v = validateCachedToken({ hotelName, officialDomain, tokenObj, source: "hit-domain" });
+                tokenValidation = { source: "hit-domain", ...v };
+                if (!v.ok) {
+                    tokenObj = null;
+                    tokenCacheDetail = `invalid-hit-domain:${v.reason}`;
+                } else {
+                    Object.assign(tokenObj, v.updates);
+                    tokenCacheDetail = "hit-domain";
+                }
             }
         }
 
@@ -218,10 +228,19 @@ export async function handleCompare({ request, env, ctx, url, corsHeaders, compa
         if (!tokenObj?.property_token) {
             tokenObj = await kvGetJson(env.CACHE_KV, tokenKeyName);
             if (tokenObj?.property_token) {
-                tokenCacheDetail = "hit-name";
+                // Validate cached token against current query
+                const v = validateCachedToken({ hotelName, officialDomain, tokenObj, source: "hit-name" });
+                tokenValidation = { source: "hit-name", ...v };
+                if (!v.ok) {
+                    tokenObj = null;
+                    tokenCacheDetail = `invalid-hit-name:${v.reason}`;
+                } else {
+                    Object.assign(tokenObj, v.updates);
+                    tokenCacheDetail = "hit-name";
 
-                if (tokenKeyDomain) {
-                    ctx.waitUntil(kvPutJson(env.CACHE_KV, tokenKeyDomain, tokenObj, TOKEN_TTL_SEC));
+                    if (tokenKeyDomain) {
+                        ctx.waitUntil(kvPutJson(env.CACHE_KV, tokenKeyDomain, tokenObj, TOKEN_TTL_SEC));
+                    }
                 }
             }
         }
@@ -377,6 +396,7 @@ export async function handleCompare({ request, env, ctx, url, corsHeaders, compa
                 tokenCacheKey: tokenKey,
                 offersCacheKey: offersKey,
                 tokenObj,
+                tokenValidation,
                 candidates: candidatesDebug,
                 officialUrl: officialUrl || null,
                 officialDomain: officialDomain || null,
@@ -572,6 +592,7 @@ export async function handleCompare({ request, env, ctx, url, corsHeaders, compa
             tokenCacheKey: tokenKey,
             offersCacheKey: offersKey,
             tokenObj,
+            tokenValidation,
             candidates: candidatesDebug,
             officialUrl: officialUrl || null,
             officialDomain: officialDomain || null,
