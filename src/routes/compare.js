@@ -36,6 +36,60 @@ import {
 } from '../lib/offers.js';
 
 /**
+ * Round to 3 decimal places for compact summaries.
+ * @param {number} x
+ * @returns {number|null}
+ */
+function round3(x) {
+    return Number.isFinite(x) ? Math.round(x * 1000) / 1000 : null;
+}
+
+/**
+ * Make a small, stable summary from pickBestProperty().allCandidates
+ * - limit payload
+ * - avoid property_token leakage
+ * - preserve why candidates were skipped
+ * @param {Array} allCandidates - Array of candidate objects from pickBestProperty
+ * @param {number} limit - Max number of top candidates to include
+ * @returns {Object|null}
+ */
+function summarizeCandidates(allCandidates, limit = 3) {
+    if (!Array.isArray(allCandidates) || allCandidates.length === 0) return null;
+
+    const skippedCounts = {};
+    const considered = [];
+
+    for (const c of allCandidates) {
+        if (c?.skipped) {
+            const r = c?.reason || "skipped";
+            skippedCounts[r] = (skippedCounts[r] || 0) + 1;
+        } else {
+            considered.push(c);
+        }
+    }
+
+    considered.sort((a, b) => {
+        const sa = (a?.finalScore ?? a?.baseScore ?? 0);
+        const sb = (b?.finalScore ?? b?.baseScore ?? 0);
+        return sb - sa;
+    });
+
+    const topCandidates = considered.slice(0, limit).map(c => ({
+        name: c?.name || null,
+        confidence: round3(c?.confidence),
+        finalScore: round3(c?.finalScore),
+        baseScore: round3(c?.baseScore),
+        domainMatch: !!c?.domainMatch,
+    }));
+
+    return {
+        topCandidates,
+        skippedCounts,
+        total: allCandidates.length,
+    };
+}
+
+/**
  * Handle /compare request.
  * @param {Object} ctx - Request context
  * @returns {Promise<Response>}
@@ -175,6 +229,10 @@ export async function handleCompare({ request, env, ctx, url, corsHeaders, compa
                 const altQuery = bookingSlug ? bookingSlug.replace(/-/g, " ") : "";
                 const picked = pickBestProperty(ctxData.properties, hotelName, officialDomain, { altQuery });
 
+                // Capture candidate summary for uncertain match explanation
+                const ctxCandidateSummary = summarizeCandidates(picked?.allCandidates, 3);
+                ctxDebug.ctxCandidateSummary = ctxCandidateSummary;
+
                 const CTX_MIN_CONFIDENCE = 0.55;
                 const acceptCtx = picked?.best?.property_token &&
                     picked.confidence >= CTX_MIN_CONFIDENCE &&
@@ -199,6 +257,7 @@ export async function handleCompare({ request, env, ctx, url, corsHeaders, compa
                         domainMatch: picked.bestDomainMatch,
                         officialDomain: officialDomain || null,
                         fromCtx: true,
+                        candidateSummary: ctxCandidateSummary,
                     };
                     tokenCacheDetail = "ctx-hit";
                     ctxDebug.ctxHit = true;
@@ -282,6 +341,7 @@ export async function handleCompare({ request, env, ctx, url, corsHeaders, compa
 
     let candidatesDebug = null;
     let debugSearch = debug ? {} : null;
+    let searchCandidateSummary = null;
 
     const usage = { searchapi_calls: { google_hotels: 0, google_hotels_property: 0 } };
 
@@ -351,6 +411,9 @@ export async function handleCompare({ request, env, ctx, url, corsHeaders, compa
             }, 404, corsHeaders);
         }
 
+        // Capture candidate summary for uncertain match explanation
+        searchCandidateSummary = summarizeCandidates(picked?.allCandidates, 3);
+
         tokenObj = {
             property_token: picked.best.property_token,
             property_name: picked.best.name || null,
@@ -364,6 +427,7 @@ export async function handleCompare({ request, env, ctx, url, corsHeaders, compa
             domainMatch: picked.bestDomainMatch,
             officialDomain: officialDomain || null,
             matchDetails: picked.matchDetails || null,
+            candidateSummary: searchCandidateSummary,
         };
 
         if (debug) {
@@ -384,6 +448,68 @@ export async function handleCompare({ request, env, ctx, url, corsHeaders, compa
             // Cache under booking slug key with slightly lower threshold
             if (tokenKeyBooking && picked.confidence >= 0.70) {
                 ctx.waitUntil(kvPutJson(env.CACHE_KV, tokenKeyBooking, tokenObj, TOKEN_TTL_NO_DOMAIN_SEC));
+            }
+        }
+    }
+
+    // ---- Verify lookup fallback for uncertain cached tokens without candidateSummary ----
+    // When we have a cached token that's uncertain but missing candidateSummary (old cache entries),
+    // make a single google_hotels call to compute the summary and backfill it.
+    const earlyMatchConfidence = tokenObj?.confidence ?? tokenObj?.nameScore ?? 0;
+    const earlyMatchUncertain = earlyMatchConfidence < 0.65;
+    const hasCachedToken = tokenCacheDetail.startsWith("hit-") || tokenCacheDetail === "ctx-hit";
+    const needsVerifyLookup = earlyMatchUncertain &&
+        !tokenObj?.candidateSummary &&
+        !ctxDebug?.ctxCandidateSummary &&
+        !searchCandidateSummary &&
+        !refresh &&
+        hasCachedToken;
+
+    if (needsVerifyLookup) {
+        usage.searchapi_calls.google_hotels++;
+
+        const verifyCall = await searchApiCall(env, {
+            engine: "google_hotels",
+            q: hotelName,
+            check_in_date: checkIn,
+            check_out_date: checkOut,
+            adults,
+            currency,
+            hl: hlToSend,
+            gl,
+        });
+
+        if (debugSearch) {
+            debugSearch.google_hotels_verify = {
+                requestUrl: verifyCall.requestUrl,
+                reason: "verify_lookup_for_uncertain_cached_token",
+                tokenCacheDetail,
+                status: verifyCall?.res?.status ?? 0,
+            };
+        }
+
+        if (verifyCall?.res?.ok && !verifyCall?.data?.error) {
+            const verifyProps = verifyCall.data?.properties || [];
+            const altQuery = bookingSlug ? bookingSlug.replace(/-/g, " ") : "";
+            const verifyPicked = pickBestProperty(verifyProps, hotelName, officialDomain, { altQuery });
+
+            if (verifyPicked?.allCandidates?.length > 0) {
+                const verifySummary = summarizeCandidates(verifyPicked.allCandidates, 3);
+                verifySummary._fromVerify = true; // Track source for response
+                searchCandidateSummary = verifySummary;
+
+                // Backfill candidateSummary to tokenObj and update KV
+                tokenObj.candidateSummary = verifySummary;
+
+                // Re-cache with the updated candidateSummary
+                const backfillTtl = tokenKeyDomain ? TOKEN_TTL_SEC : TOKEN_TTL_NO_DOMAIN_SEC;
+                if (tokenCacheDetail === "hit-domain" && tokenKeyDomain) {
+                    ctx.waitUntil(kvPutJson(env.CACHE_KV, tokenKeyDomain, tokenObj, TOKEN_TTL_SEC));
+                } else if (tokenCacheDetail === "hit-booking" && tokenKeyBooking) {
+                    ctx.waitUntil(kvPutJson(env.CACHE_KV, tokenKeyBooking, tokenObj, TOKEN_TTL_NO_DOMAIN_SEC));
+                } else if (tokenCacheDetail === "hit-name") {
+                    ctx.waitUntil(kvPutJson(env.CACHE_KV, tokenKeyName, tokenObj, backfillTtl));
+                }
             }
         }
     }
@@ -415,20 +541,39 @@ export async function handleCompare({ request, env, ctx, url, corsHeaders, compa
                 officialDomain: officialDomain || null,
                 currentHost: currentHost || null,
             },
-            match: {
-                cacheDetail: { token: tokenCacheDetail, offers: "hit" },
-                tokenCacheKey: tokenKey,
-                tokenKeyName,
-                tokenKeyDomain: tokenKeyDomain || null,
-                matchedBy: tokenObj?.domainMatch ? "officialDomain" : "name",
-                confidence: tokenObj?.confidence ?? tokenObj?.nameScore ?? 0,
-                matchedHotelName: tokenObj?.property_name || null,
-                nameScore: tokenObj?.nameScore ?? null,
-                domainMatch: tokenObj?.domainMatch ?? null,
-                linkHost: tokenObj?.linkHost || null,
-                matchDetails: tokenObj?.matchDetails || null,
-                ...ctxDebug,
-            },
+            match: (() => {
+                const matchConfidence = tokenObj?.confidence ?? tokenObj?.nameScore ?? 0;
+                const matchUncertain = matchConfidence < 0.65;
+
+                // Select candidate summary source in priority order
+                let candidateSummary = null;
+                let candidateSummarySource = null;
+                if (matchUncertain) {
+                    if (ctxDebug?.ctxCandidateSummary) {
+                        candidateSummary = ctxDebug.ctxCandidateSummary;
+                        candidateSummarySource = "ctx";
+                    } else if (tokenObj?.candidateSummary) {
+                        candidateSummary = tokenObj.candidateSummary;
+                        candidateSummarySource = "token";
+                    }
+                }
+
+                return {
+                    cacheDetail: { token: tokenCacheDetail, offers: "hit" },
+                    tokenCacheKey: tokenKey,
+                    tokenKeyName,
+                    tokenKeyDomain: tokenKeyDomain || null,
+                    matchedBy: tokenObj?.domainMatch ? "officialDomain" : "name",
+                    confidence: matchConfidence,
+                    matchedHotelName: tokenObj?.property_name || null,
+                    nameScore: tokenObj?.nameScore ?? null,
+                    domainMatch: tokenObj?.domainMatch ?? null,
+                    linkHost: tokenObj?.linkHost || null,
+                    matchDetails: tokenObj?.matchDetails || null,
+                    ...ctxDebug,
+                    ...(matchUncertain ? { candidateSummary, candidateSummarySource } : {}),
+                };
+            })(),
             matchUncertain: (tokenObj?.confidence ?? tokenObj?.nameScore ?? 0) < 0.65,
             usage: { searchapi_calls: { google_hotels: 0, google_hotels_property: 0 } },
         };
@@ -597,20 +742,44 @@ export async function handleCompare({ request, env, ctx, url, corsHeaders, compa
             currentHost: currentHost || null,
         },
         nights,
-        match: {
-            cacheDetail: { token: tokenCacheDetail, offers: "miss" },
-            tokenCacheKey: tokenKey,
-            tokenKeyName,
-            tokenKeyDomain: tokenKeyDomain || null,
-            matchedBy: tokenObj.domainMatch ? "officialDomain" : "name",
-            confidence: tokenObj.confidence ?? tokenObj.nameScore ?? 0,
-            matchedHotelName: tokenObj.property_name || null,
-            nameScore: tokenObj.nameScore ?? null,
-            domainMatch: tokenObj.domainMatch ?? null,
-            linkHost: tokenObj.linkHost || null,
-            matchDetails: tokenObj.matchDetails || null,
-            ...ctxDebug,
-        },
+        match: (() => {
+            const matchConfidence = tokenObj.confidence ?? tokenObj.nameScore ?? 0;
+            const matchUncertain = matchConfidence < 0.65;
+
+            // Select candidate summary source in priority order
+            let candidateSummary = null;
+            let candidateSummarySource = null;
+            if (matchUncertain) {
+                if (searchCandidateSummary) {
+                    candidateSummary = searchCandidateSummary;
+                    candidateSummarySource = searchCandidateSummary._fromVerify ? "verify" : "searchapi";
+                    // Clean up internal flag before sending
+                    if (candidateSummary._fromVerify) delete candidateSummary._fromVerify;
+                } else if (ctxDebug?.ctxCandidateSummary) {
+                    candidateSummary = ctxDebug.ctxCandidateSummary;
+                    candidateSummarySource = "ctx";
+                } else if (tokenObj?.candidateSummary) {
+                    candidateSummary = tokenObj.candidateSummary;
+                    candidateSummarySource = "token";
+                }
+            }
+
+            return {
+                cacheDetail: { token: tokenCacheDetail, offers: "miss" },
+                tokenCacheKey: tokenKey,
+                tokenKeyName,
+                tokenKeyDomain: tokenKeyDomain || null,
+                matchedBy: tokenObj.domainMatch ? "officialDomain" : "name",
+                confidence: matchConfidence,
+                matchedHotelName: tokenObj.property_name || null,
+                nameScore: tokenObj.nameScore ?? null,
+                domainMatch: tokenObj.domainMatch ?? null,
+                linkHost: tokenObj.linkHost || null,
+                matchDetails: tokenObj.matchDetails || null,
+                ...ctxDebug,
+                ...(matchUncertain ? { candidateSummary, candidateSummarySource } : {}),
+            };
+        })(),
         matchUncertain: (tokenObj.confidence ?? tokenObj.nameScore ?? 0) < 0.65,
         property: {
             name: prop.name || tokenObj.property_name || hotelName,

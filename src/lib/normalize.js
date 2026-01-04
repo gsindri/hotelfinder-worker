@@ -138,12 +138,28 @@ export function parseMoneyToNumber(val) {
 
 /**
  * Get hostname without www prefix.
- * @param {string} s - URL string
+ * Handles full URLs, protocol-relative URLs, and bare domains.
+ * @param {string} s - URL string or bare domain
  * @returns {string}
  */
 export function getHostNoWww(s) {
+    const raw = String(s || "").trim();
+    if (!raw) return "";
+
     try {
-        return new URL(s).hostname.toLowerCase().replace(/^www\./, "");
+        // If already has a scheme, parse directly
+        if (/^[a-z][a-z0-9+.-]*:\/\//i.test(raw)) {
+            return new URL(raw).hostname.toLowerCase().replace(/^www\./, "");
+        }
+
+        // Handle protocol-relative URLs: //example.com/path
+        if (raw.startsWith("//")) {
+            return new URL("https:" + raw).hostname.toLowerCase().replace(/^www\./, "");
+        }
+
+        // Bare host or host+path: example.com, example.com/path
+        // Add a default scheme so URL() can parse it
+        return new URL("https://" + raw).hostname.toLowerCase().replace(/^www\./, "");
     } catch {
         return "";
     }
