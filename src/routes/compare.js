@@ -256,9 +256,11 @@ export async function handleCompare({ request, env, ctx, url, corsHeaders, compa
                         confidence: picked.confidence,
                         domainMatch: picked.bestDomainMatch,
                         officialDomain: officialDomain || null,
+                        matchDetails: picked.matchDetails || null, // B2b: propagate matchDetails for UI integrity checks
                         fromCtx: true,
                         candidateSummary: ctxCandidateSummary,
                     };
+
                     tokenCacheDetail = "ctx-hit";
                     ctxDebug.ctxHit = true;
 
