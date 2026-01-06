@@ -5,12 +5,21 @@ import { describe, it, expect } from 'vitest';
 // For now, mock the structure to test the logic
 
 /**
- * Test helper - mimics normalizeForIncludes
+ * Test helper - strip diacritics
+ */
+function stripDiacritics(s) {
+    return String(s || "")
+        .normalize("NFD")
+        .replace(/[\u0300-\u036f]/g, "");
+}
+
+/**
+ * Test helper - mimics normalizeForIncludes (Unicode-aware)
  */
 function normalizeForIncludes(s) {
-    return String(s || "")
+    return stripDiacritics(s)
         .toLowerCase()
-        .replace(/[^a-z0-9]+/g, " ")
+        .replace(/[^\p{L}\p{N}]+/gu, " ")
         .trim();
 }
 
@@ -142,6 +151,109 @@ describe('Phrase-aware brand matching', () => {
             const cBrands = extractStrictBrands("Hilton Green Room Apartments");
             const brandMismatch = (qBrands.size > 0) && !hasAnyOverlap(qBrands, cBrands);
             expect(brandMismatch).toBe(false); // Query has no brand, so no enforcement
+        });
+    });
+});
+
+// ---------- Diacritics/Unicode Normalization Tests ----------
+
+describe('Diacritics and Unicode handling', () => {
+
+    describe('stripDiacritics', () => {
+        it('strips Icelandic accents: "Reykjavík" → "Reykjavik"', () => {
+            expect(stripDiacritics("Reykjavík")).toBe("Reykjavik");
+        });
+
+        it('strips French accents: "Hôtel" → "Hotel"', () => {
+            expect(stripDiacritics("Hôtel")).toBe("Hotel");
+        });
+
+        it('strips Spanish ñ: "España" → "Espana"', () => {
+            expect(stripDiacritics("España")).toBe("Espana");
+        });
+
+        it('strips German umlauts: "München" → "Munchen"', () => {
+            expect(stripDiacritics("München")).toBe("Munchen");
+        });
+    });
+
+    describe('normalizeForIncludes with diacritics', () => {
+        it('normalizes "Hótel Borg Reykjavík" correctly', () => {
+            const result = normalizeForIncludes("Hótel Borg Reykjavík");
+            expect(result).toBe("hotel borg reykjavik");
+        });
+
+        it('normalizes "Café del Mar" correctly', () => {
+            const result = normalizeForIncludes("Café del Mar");
+            expect(result).toBe("cafe del mar");
+        });
+
+        it('preserves non-Latin scripts (Chinese)', () => {
+            // Chinese characters have no diacritics, should pass through
+            const result = normalizeForIncludes("北京饭店");
+            expect(result).toBe("北京饭店");
+        });
+    });
+
+    describe('Hotel matching with diacritics', () => {
+        it('matches "Hótel Borg" vs "Hotel Borg" as similar', () => {
+            const a = normalizeForIncludes("Hótel Borg");
+            const b = normalizeForIncludes("Hotel Borg");
+            expect(a).toBe(b);
+        });
+
+        it('Reykjavík hotels normalize consistently', () => {
+            const a = normalizeForIncludes("Center Hotels Reykjavík");
+            const b = normalizeForIncludes("Center Hotels Reykjavik");
+            expect(a).toBe(b);
+        });
+    });
+
+    describe('tokenizeRaw vs tokenizeName (stopword handling)', () => {
+        // Test helper for tokenizeRaw (no stopword removal)
+        function tokenizeRaw(s) {
+            return stripDiacritics(s)
+                .toLowerCase()
+                .replace(/[^\p{L}\p{N}]+/gu, " ")
+                .split(/\s+/)
+                .map((t) => t.trim())
+                .filter(Boolean)
+                .filter((t) => t.length > 1);
+        }
+
+        // Test helper for tokenizeName (with stopword removal)
+        const STOP_WORDS = new Set(["hotel", "by", "the", "and", "of", "at", "in", "a", "an", "resort", "inn", "apartments", "apartment", "suites", "suite", "hostel", "guesthouse"]);
+        function tokenizeName(s) {
+            return tokenizeRaw(s).filter((t) => !STOP_WORDS.has(t));
+        }
+
+        it('"Alda Hotel" has 2 raw tokens but 1 match token', () => {
+            expect(tokenizeRaw("Alda Hotel")).toEqual(["alda", "hotel"]);
+            expect(tokenizeName("Alda Hotel")).toEqual(["alda"]);
+        });
+
+        it('"Green Room Apartments" has 3 raw tokens but 2 match tokens', () => {
+            expect(tokenizeRaw("Green Room Apartments")).toEqual(["green", "room", "apartments"]);
+            expect(tokenizeName("Green Room Apartments")).toEqual(["green", "room"]);
+        });
+
+        it('Contains boost gate should pass for "Alda Hotel" (2 raw tokens >= 2)', () => {
+            const candidate = "Alda Hotel";
+            const query = "Alda Hotel Reykjavik";
+            const cNorm = normalizeForIncludes(candidate);
+            const qNorm = normalizeForIncludes(query);
+
+            // Old gate would fail: tokenizeName(candidate).length >= 2 → 1 >= 2 → false
+            const oldGatePasses = tokenizeName(candidate).length >= 2;
+            expect(oldGatePasses).toBe(false);
+
+            // New gate passes: tokenizeRaw(candidate).length >= 2 → 2 >= 2 → true
+            const newGatePasses = tokenizeRaw(candidate).length >= 2;
+            expect(newGatePasses).toBe(true);
+
+            // And the substring check passes
+            expect(qNorm.includes(cNorm)).toBe(true);
+            expect(cNorm.length >= 6).toBe(true);
         });
     });
 });
@@ -505,6 +617,185 @@ describe('Accommodation type signals', () => {
             const cType = extractAccommodationTypeGroups("Green Room");
             const boost = computeTypeBoost(qType, cType);
             expect(boost).toBe(0); // Neither has type
+        });
+    });
+});
+
+// ---------- Reykjavík Regression Tests ----------
+// These tests verify the fixes for the "everything is 55%" failure mode
+
+describe('Reykjavík matching regression tests', () => {
+
+    // Re-implement scoreNameMatchDetailed locally for testing
+    // This mirrors the production logic with the fixes applied
+    const NAME_STOP_WORDS = new Set([
+        "hotel", "by", "the", "and", "of", "at", "in", "a", "an", "resort", "inn",
+        "apartments", "apartment", "suites", "suite", "hostel", "guesthouse",
+    ]);
+
+    function tokenizeRaw(s) {
+        return stripDiacritics(s)
+            .toLowerCase()
+            .replace(/[^\p{L}\p{N}]+/gu, " ")
+            .split(/\s+/)
+            .map((t) => t.trim())
+            .filter(Boolean)
+            .filter((t) => t.length > 1);
+    }
+
+    function tokenizeName(s) {
+        return tokenizeRaw(s).filter((t) => !NAME_STOP_WORDS.has(t));
+    }
+
+    function scoreNameMatchDetailed(query, candidate) {
+        const qNorm = normalizeForIncludes(query);
+        const cNorm = normalizeForIncludes(candidate);
+
+        // Base token coverage
+        const qTokens = tokenizeName(query);
+        const cTokens = new Set(tokenizeName(candidate));
+        let hit = 0;
+        for (const t of qTokens) if (cTokens.has(t)) hit++;
+        const coverage = qTokens.length ? hit / qTokens.length : 0;
+
+        // Contains boost (uses tokenizeRaw, not tokenizeName)
+        const qContainsC = qNorm.includes(cNorm) && cNorm.length >= 6 && tokenizeRaw(candidate).length >= 2;
+        const cContainsQ = cNorm.includes(qNorm) && qNorm.length >= 6;
+        const containsBoost = (qContainsC || cContainsQ) ? 0.25 : 0;
+
+        const baseScore = coverage + containsBoost;
+
+        return {
+            baseScore,
+            coverage,
+            containsBoost,
+            qNorm,
+            cNorm,
+            qTokens,
+            cTokens: [...cTokens],
+        };
+    }
+
+    describe('1. Diacritics normalization', () => {
+        it('"Reykjavík" normalizes consistently with "Reykjavik"', () => {
+            expect(normalizeForIncludes("Reykjavík")).toBe(normalizeForIncludes("Reykjavik"));
+        });
+
+        it('"Hótel Borg" normalizes to "hotel borg"', () => {
+            expect(normalizeForIncludes("Hótel Borg")).toBe("hotel borg");
+        });
+
+        it('"Alda Hotel Reykjavík" tokenizes correctly', () => {
+            const tokens = tokenizeName("Alda Hotel Reykjavík");
+            expect(tokens).toContain("alda");
+            expect(tokens).toContain("reykjavik");
+            expect(tokens).not.toContain("hotel"); // Stopword removed
+        });
+    });
+
+    describe('2. Contains boost with stopword-reduced names', () => {
+        it('"Alda Hotel" has 2 raw tokens (passes gate)', () => {
+            expect(tokenizeRaw("Alda Hotel").length).toBe(2);
+        });
+
+        it('"Alda Hotel Reykjavík" vs "Alda Hotel" → containsBoost > 0', () => {
+            const result = scoreNameMatchDetailed("Alda Hotel Reykjavík", "Alda Hotel");
+            expect(result.containsBoost).toBeGreaterThan(0);
+        });
+
+        it('"Alda Hotel Reykjavík" vs "Alda Hotel" → baseScore >= 0.75', () => {
+            const result = scoreNameMatchDetailed("Alda Hotel Reykjavík", "Alda Hotel");
+            expect(result.baseScore).toBeGreaterThanOrEqual(0.75);
+        });
+    });
+
+    describe('3. Competing Reykjavík hotels score lower', () => {
+        it('"Alda Hotel Reykjavík" vs "Hotel Reykjavík Grand" → no containsBoost', () => {
+            const result = scoreNameMatchDetailed("Alda Hotel Reykjavík", "Hotel Reykjavík Grand");
+            expect(result.containsBoost).toBe(0);
+        });
+
+        it('"Alda Hotel Reykjavík" vs "Hotel Reykjavík Grand" → baseScore around 0.5', () => {
+            const result = scoreNameMatchDetailed("Alda Hotel Reykjavík", "Hotel Reykjavík Grand");
+            // Should be low coverage (only "reykjavik" matches)
+            expect(result.baseScore).toBeLessThan(0.65);
+            expect(result.baseScore).toBeGreaterThan(0.3);
+        });
+
+        it('Alda scores HIGHER than competing Reykjavík hotel', () => {
+            const aldaScore = scoreNameMatchDetailed("Alda Hotel Reykjavík", "Alda Hotel").baseScore;
+            const competitorScore = scoreNameMatchDetailed("Alda Hotel Reykjavík", "Hotel Reykjavík Grand").baseScore;
+
+            expect(aldaScore).toBeGreaterThan(competitorScore);
+            expect(aldaScore - competitorScore).toBeGreaterThan(0.2); // Substantial margin
+        });
+
+        it('Alda scores HIGHER than Center Hotels Reykjavík', () => {
+            const aldaScore = scoreNameMatchDetailed("Alda Hotel Reykjavík", "Alda Hotel").baseScore;
+            const centerScore = scoreNameMatchDetailed("Alda Hotel Reykjavík", "Center Hotels Reykjavík").baseScore;
+
+            expect(aldaScore).toBeGreaterThan(centerScore);
+        });
+    });
+
+    describe('4. pickBestProperty chooses correctly', () => {
+        // Minimal pickBestProperty implementation for testing
+        function pickBestPropertySimple(candidates, hotelName) {
+            let best = null;
+            let bestScore = -1;
+
+            for (const c of candidates) {
+                const result = scoreNameMatchDetailed(hotelName, c.name);
+                if (result.baseScore > bestScore) {
+                    bestScore = result.baseScore;
+                    best = c;
+                }
+            }
+
+            return { best, bestScore };
+        }
+
+        it('Picks "Alda Hotel" from mixed Reykjavík candidates', () => {
+            const candidates = [
+                { name: "Hotel Reykjavík Grand", property_token: "hrg123" },
+                { name: "Alda Hotel", property_token: "alda123" },
+                { name: "Center Hotels Reykjavík", property_token: "chr123" },
+                { name: "Fosshotel Reykjavík", property_token: "foss123" },
+            ];
+
+            const result = pickBestPropertySimple(candidates, "Alda Hotel Reykjavík");
+
+            expect(result.best.name).toBe("Alda Hotel");
+            expect(result.bestScore).toBeGreaterThanOrEqual(0.75);
+        });
+
+        it('Picks "Hótel Borg" despite diacritics variation', () => {
+            const candidates = [
+                { name: "Center Hotels Plaza", property_token: "chp123" },
+                { name: "Hotel Borg", property_token: "borg123" },  // ASCII version
+                { name: "Hotel Reykjavík Centrum", property_token: "hrc123" },
+            ];
+
+            const result = pickBestPropertySimple(candidates, "Hótel Borg Reykjavík");
+
+            expect(result.best.name).toBe("Hotel Borg");
+        });
+
+        it('Does not tie on city-only overlap', () => {
+            const candidates = [
+                { name: "Hotel A Reykjavík", property_token: "a123" },
+                { name: "Hotel B Reykjavík", property_token: "b123" },
+                { name: "Alda Hotel", property_token: "alda123" },
+            ];
+
+            // Query for Alda - the city-only matches should score LOWER than the name match
+            const result = pickBestPropertySimple(candidates, "Alda Hotel Reykjavík");
+
+            expect(result.best.name).toBe("Alda Hotel");
+
+            // Verify the alternatives score lower
+            const hotelAScore = scoreNameMatchDetailed("Alda Hotel Reykjavík", "Hotel A Reykjavík").baseScore;
+            expect(result.bestScore).toBeGreaterThan(hotelAScore);
         });
     });
 });

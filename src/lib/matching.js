@@ -27,14 +27,27 @@ const NAME_STOP_WORDS = new Set([
 ]);
 
 /**
+ * Strip diacritics/accents from a string.
+ * Converts "Reykjavík" → "Reykjavik", "Hôtel" → "Hotel", etc.
+ * @param {string} s - String to normalize
+ * @returns {string}
+ */
+export function stripDiacritics(s) {
+    return String(s || "")
+        .normalize("NFD")
+        .replace(/[\u0300-\u036f]/g, "");
+}
+
+/**
  * Tokenize a hotel name for matching.
+ * Unicode-aware: handles international characters (í, ó, ñ, ü, etc.)
  * @param {string} s - Name to tokenize
  * @returns {string[]}
  */
 export function tokenizeName(s) {
-    return String(s || "")
+    return stripDiacritics(s)
         .toLowerCase()
-        .replace(/[^a-z0-9]+/g, " ")
+        .replace(/[^\p{L}\p{N}]+/gu, " ")
         .split(/\s+/)
         .map((t) => t.trim())
         .filter(Boolean)
@@ -42,14 +55,31 @@ export function tokenizeName(s) {
 }
 
 /**
+ * Tokenize a hotel name WITHOUT stopword removal.
+ * Used for "contains" boost gating where stopwords like "hotel" still count.
+ * @param {string} s - Name to tokenize
+ * @returns {string[]}
+ */
+export function tokenizeRaw(s) {
+    return stripDiacritics(s)
+        .toLowerCase()
+        .replace(/[^\p{L}\p{N}]+/gu, " ")
+        .split(/\s+/)
+        .map((t) => t.trim())
+        .filter(Boolean)
+        .filter((t) => t.length > 1);
+}
+
+/**
  * Normalize string for includes-based matching.
+ * Unicode-aware: handles international characters.
  * @param {string} s - String to normalize
  * @returns {string}
  */
 export function normalizeForIncludes(s) {
-    return String(s || "")
+    return stripDiacritics(s)
         .toLowerCase()
-        .replace(/[^a-z0-9]+/g, " ")
+        .replace(/[^\p{L}\p{N}]+/gu, " ")
         .trim();
 }
 
@@ -310,7 +340,8 @@ export function scoreNameMatchDetailed(query, candidate) {
     const coverage = qTokens.length ? hit / qTokens.length : 0;
 
     // Bidirectional contains boost: query contains candidate OR candidate contains query
-    const qContainsC = qNorm.includes(cNorm) && cNorm.length >= 6 && tokenizeName(candidate).length >= 2;
+    // Use tokenizeRaw (not tokenizeName) so stopwords like "hotel" still count toward the 2-token gate
+    const qContainsC = qNorm.includes(cNorm) && cNorm.length >= 6 && tokenizeRaw(candidate).length >= 2;
     const cContainsQ = cNorm.includes(qNorm) && qNorm.length >= 6;
     const containsBoost = (qContainsC || cContainsQ) ? 0.25 : 0;
 

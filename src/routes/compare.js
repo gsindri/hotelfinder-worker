@@ -234,8 +234,22 @@ export async function handleCompare({ request, env, ctx, url, corsHeaders, compa
                 ctxDebug.ctxCandidateSummary = ctxCandidateSummary;
 
                 const CTX_MIN_CONFIDENCE = 0.55;
+                const CTX_STRONG_CONFIDENCE = 0.65;
+
+                // Accept ctx if:
+                // 1. High confidence (>= 0.65), OR
+                // 2. Medium confidence (0.55-0.65) WITH a strong signal:
+                //    - containsBoost > 0 (query/candidate contains relationship), OR
+                //    - domainMatch (official domain matches)
+                const hasStrongSignal =
+                    (picked.matchDetails?.containsBoost > 0) ||
+                    (picked.bestDomainMatch === true);
+
+                const confidenceOk = picked.confidence >= CTX_STRONG_CONFIDENCE ||
+                    (picked.confidence >= CTX_MIN_CONFIDENCE && hasStrongSignal);
+
                 const acceptCtx = picked?.best?.property_token &&
-                    picked.confidence >= CTX_MIN_CONFIDENCE &&
+                    confidenceOk &&
                     !picked.matchDetails?.hardMismatch;
 
                 ctxDebug.ctxNameScore = picked?.bestNameScore ?? null;
@@ -276,9 +290,16 @@ export async function handleCompare({ request, env, ctx, url, corsHeaders, compa
                     }
                 } else if (picked?.best?.property_token) {
                     tokenCacheDetail = "ctx-nomatch";
-                    ctxDebug.ctxRejectedReason = picked.confidence < CTX_MIN_CONFIDENCE
-                        ? `confidence_too_low:${picked.confidence?.toFixed(3)}`
-                        : picked.matchDetails?.hardMismatch ? "hard_mismatch" : "unknown";
+                    // Explain rejection reason based on new conditional logic
+                    if (picked.matchDetails?.hardMismatch) {
+                        ctxDebug.ctxRejectedReason = "hard_mismatch";
+                    } else if (picked.confidence < CTX_MIN_CONFIDENCE) {
+                        ctxDebug.ctxRejectedReason = `confidence_too_low:${picked.confidence?.toFixed(3)}`;
+                    } else if (picked.confidence < CTX_STRONG_CONFIDENCE && !hasStrongSignal) {
+                        ctxDebug.ctxRejectedReason = `medium_confidence_no_strong_signal:${picked.confidence?.toFixed(3)}`;
+                    } else {
+                        ctxDebug.ctxRejectedReason = "unknown";
+                    }
                 } else {
                     ctxDebug.ctxRejectedReason = "no_matching_property";
                 }
