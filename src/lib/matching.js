@@ -12,6 +12,7 @@ import {
     KEY_GROUP_BOOST_WEAK,
     KEY_GROUP_BOOST_CAP,
     MIN_SCORE_FOR_DOMAIN_BOOST,
+    HIT_DOMAIN_MIN_SCORE,
     ACCOM_TYPE_GROUPS,
     TYPE_MATCH_BOOST,
     TYPE_MISMATCH_PENALTY_STRONG,
@@ -219,6 +220,32 @@ const LOCATION_QUALIFIERS = new Set([
 ]);
 
 /**
+ * Extract core identity tokens from a hotel name, excluding location tokens.
+ * This identifies the unique "identity" of a hotel (e.g., "Saga" in "Hotel Reykjavik Saga").
+ * @param {string} name - Hotel name
+ * @param {string} [city] - City name to exclude
+ * @param {string} [country] - Country name to exclude
+ * @returns {string[]} Core identity tokens
+ */
+export function extractCoreTokens(name, city, country) {
+    const tokens = tokenizeName(name);
+
+    // Build set of location tokens to exclude
+    const locationTokens = new Set();
+    if (city) {
+        for (const t of tokenizeName(city)) locationTokens.add(t);
+    }
+    if (country) {
+        for (const t of tokenizeName(country)) locationTokens.add(t);
+    }
+    // Also exclude location qualifiers
+    for (const q of LOCATION_QUALIFIERS) locationTokens.add(q);
+
+    // Filter out location tokens
+    return tokens.filter(t => !locationTokens.has(t));
+}
+
+/**
  * Strip trailing location suffix from query if it matches candidate's city/country.
  * Only strips suffixes after comma or dash that match the candidate's location.
  * Prevents false stripping (e.g., "New York" won't match "York").
@@ -295,9 +322,12 @@ export function hasAnyOverlap(setA, setB) {
  * Detailed name match with hard mismatch detection.
  * @param {string} query - Query hotel name
  * @param {string} candidate - Candidate hotel name
+ * @param {Object} [opts] - Options
+ * @param {string} [opts.city] - Candidate city for core token extraction
+ * @param {string} [opts.country] - Candidate country for core token extraction
  * @returns {Object}
  */
-export function scoreNameMatchDetailed(query, candidate) {
+export function scoreNameMatchDetailed(query, candidate, opts = {}) {
     const qNorm = normalizeForIncludes(query);
     const cNorm = normalizeForIncludes(candidate);
 
@@ -338,6 +368,19 @@ export function scoreNameMatchDetailed(query, candidate) {
     let hit = 0;
     for (const t of qTokens) if (cTokens.has(t)) hit++;
     const coverage = qTokens.length ? hit / qTokens.length : 0;
+
+    // --- Core identity overlap (excludes location tokens) ---
+    // This detects when only city/location overlaps (e.g., "Reykjavik")
+    // but unique identity tokens don't (e.g., "Saga" vs "Grand")
+    const city = opts.city || "";
+    const country = opts.country || "";
+    const qCoreTokens = extractCoreTokens(query, city, country);
+    const cCoreTokens = new Set(extractCoreTokens(candidate, city, country));
+    let coreHit = 0;
+    for (const t of qCoreTokens) if (cCoreTokens.has(t)) coreHit++;
+    const coreOverlapAny = coreHit > 0;
+    // onlyLocationOverlap: tokens overlap but core identity doesn't
+    const onlyLocationOverlap = hit > 0 && qCoreTokens.length > 0 && !coreOverlapAny;
 
     // Bidirectional contains boost: query contains candidate OR candidate contains query
     // Use tokenizeRaw (not tokenizeName) so stopwords like "hotel" still count toward the 2-token gate
@@ -403,6 +446,11 @@ export function scoreNameMatchDetailed(query, candidate) {
         coverage,
         containsBoost,
         baseScore,
+        // Core identity overlap fields
+        qCoreTokens,
+        cCoreTokens: [...cCoreTokens],
+        coreOverlapAny,
+        onlyLocationOverlap,
     };
 }
 
@@ -482,13 +530,21 @@ export function validateCachedToken({ hotelName, officialDomain, tokenObj, sourc
     const locationStrip = stripTrailingLocationSuffix(hotelName, tokenObj?.city, tokenObj?.country);
     const queryForScore = locationStrip.stripped;
 
-    const details = scoreNameMatchDetailed(queryForScore, candidateName);
+    // Pass city/country for core identity token extraction
+    const details = scoreNameMatchDetailed(queryForScore, candidateName, {
+        city: tokenObj?.city,
+        country: tokenObj?.country
+    });
     details.queryOriginal = hotelName;
     details.queryForScore = queryForScore;
     details.locationSuffixStripped = locationStrip.wasStripped;
 
     const baseScore = details.baseScore;
-    const confidence = computeConfidence(domainMatch, baseScore, details.hardMismatch);
+    const coreOverlapAny = details.coreOverlapAny ?? true; // Default true for backwards compat
+
+    // Confidence uses identity-gated domain match
+    const domainMatchForConfidence = domainMatch && coreOverlapAny;
+    const confidence = computeConfidence(domainMatchForConfidence, baseScore, details.hardMismatch);
 
     // Validation thresholds:
     // - Always reject hardMismatch
@@ -500,13 +556,16 @@ export function validateCachedToken({ hotelName, officialDomain, tokenObj, sourc
             confidence,
             baseScore,
             domainMatch,
+            coreOverlapAny,
             queryForScore
         };
     }
 
-    // - For hit-domain, still require some baseScore to avoid chain-domain collisions
+    // - For hit-domain, require stricter validation:
+    //   baseScore >= HIT_DOMAIN_MIN_SCORE (0.70) AND coreOverlapAny
+    //   This prevents sister hotels on same domain from being cached together
     if (source === "hit-domain") {
-        if (baseScore < MIN_SCORE_FOR_DOMAIN_BOOST) {
+        if (baseScore < HIT_DOMAIN_MIN_SCORE) {
             return {
                 ok: false,
                 reason: `domain_hit_but_name_too_low:${baseScore.toFixed(3)}`,
@@ -514,6 +573,19 @@ export function validateCachedToken({ hotelName, officialDomain, tokenObj, sourc
                 confidence,
                 baseScore,
                 domainMatch,
+                coreOverlapAny,
+                queryForScore
+            };
+        }
+        if (!coreOverlapAny) {
+            return {
+                ok: false,
+                reason: "domain_hit_no_identity_overlap",
+                details,
+                confidence,
+                baseScore,
+                domainMatch,
+                coreOverlapAny,
                 queryForScore
             };
         }
@@ -527,6 +599,7 @@ export function validateCachedToken({ hotelName, officialDomain, tokenObj, sourc
                 confidence,
                 baseScore,
                 domainMatch,
+                coreOverlapAny,
                 queryForScore
             };
         }
@@ -540,12 +613,14 @@ export function validateCachedToken({ hotelName, officialDomain, tokenObj, sourc
             nameScore: baseScore,
             confidence,
             domainMatch,
+            coreOverlapAny,
             matchDetails: details,
             officialDomain: officialDomain || null,
         },
         confidence,
         baseScore,
         domainMatch,
+        coreOverlapAny,
         queryForScore,
         details,
     };
@@ -579,7 +654,7 @@ export function pickBestProperty(properties, hotelName, officialDomain, opts = {
         const locationStrip = stripTrailingLocationSuffix(hotelName, p?.city, p?.country);
         const queryForScore = locationStrip.stripped;
 
-        const matchDetails = scoreNameMatchDetailed(queryForScore, p?.name || "");
+        const matchDetails = scoreNameMatchDetailed(queryForScore, p?.name || "", { city: p?.city, country: p?.country });
 
         // Add location stripping metadata to match details
         matchDetails.queryOriginal = hotelName;
@@ -608,7 +683,7 @@ export function pickBestProperty(properties, hotelName, officialDomain, opts = {
         let altBaseScore = null;
 
         if (altQuery) {
-            const alt = scoreNameMatchDetailed(altQuery, p?.name || "");
+            const alt = scoreNameMatchDetailed(altQuery, p?.name || "", { city: p?.city, country: p?.country });
             altBaseScore = alt.baseScore;
             // Only use alt if it improves score AND doesn't have its own hardMismatch
             if (!alt.hardMismatch && alt.baseScore > baseScore) {
@@ -623,9 +698,19 @@ export function pickBestProperty(properties, hotelName, officialDomain, opts = {
         matchDetails.mainBaseScore = matchDetails.baseScore;
         matchDetails.effectiveBaseScore = baseScore;
 
-        const domainBoost = computeDomainBoost(domainMatch, baseScore);
+        // Gate domain boost on core identity overlap
+        // This prevents sister hotels on same parent domain from being falsely boosted
+        const coreOverlapAny = matchDetails.coreOverlapAny ?? true; // Default true for backwards compat
+        const domainBoostAllowed = domainMatch && coreOverlapAny;
+        const domainBoost = computeDomainBoost(domainBoostAllowed, baseScore);
         const finalScore = baseScore + domainBoost;
-        const confidence = computeConfidence(domainMatch, baseScore, matchDetails.hardMismatch);
+
+        // Confidence boost also requires identity overlap
+        const domainMatchForConfidence = domainMatch && coreOverlapAny;
+        const confidence = computeConfidence(domainMatchForConfidence, baseScore, matchDetails.hardMismatch);
+
+        // Track if domain boost was blocked due to no identity overlap
+        matchDetails.domainBoostBlocked = domainMatch && !coreOverlapAny;
 
         allCandidates.push({
             name: p?.name,

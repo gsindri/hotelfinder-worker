@@ -306,24 +306,7 @@ export async function handleCompare({ request, env, ctx, url, corsHeaders, compa
             }
         }
 
-        // 2) Try domain key (more stable/trusted)
-        if (!tokenObj?.property_token && tokenKeyDomain) {
-            tokenObj = await kvGetJson(env.CACHE_KV, tokenKeyDomain);
-            if (tokenObj?.property_token) {
-                // Validate cached token against current query
-                const v = validateCachedToken({ hotelName, officialDomain, tokenObj, source: "hit-domain" });
-                tokenValidation = { source: "hit-domain", ...v };
-                if (!v.ok) {
-                    tokenObj = null;
-                    tokenCacheDetail = `invalid-hit-domain:${v.reason}`;
-                } else {
-                    Object.assign(tokenObj, v.updates);
-                    tokenCacheDetail = "hit-domain";
-                }
-            }
-        }
-
-        // 2.5) Try booking slug key (stable across name variations)
+        // 2) Try booking slug key first (most unique identifier on Booking.com)
         if (!tokenObj?.property_token && tokenKeyBooking) {
             tokenObj = await kvGetJson(env.CACHE_KV, tokenKeyBooking);
             if (tokenObj?.property_token) {
@@ -336,6 +319,23 @@ export async function handleCompare({ request, env, ctx, url, corsHeaders, compa
                 } else {
                     Object.assign(tokenObj, v.updates);
                     tokenCacheDetail = "hit-booking";
+                }
+            }
+        }
+
+        // 2.5) Try domain key (less unique for portfolio/chain domains)
+        if (!tokenObj?.property_token && tokenKeyDomain) {
+            tokenObj = await kvGetJson(env.CACHE_KV, tokenKeyDomain);
+            if (tokenObj?.property_token) {
+                // Validate cached token against current query
+                const v = validateCachedToken({ hotelName, officialDomain, tokenObj, source: "hit-domain" });
+                tokenValidation = { source: "hit-domain", ...v };
+                if (!v.ok) {
+                    tokenObj = null;
+                    tokenCacheDetail = `invalid-hit-domain:${v.reason}`;
+                } else {
+                    Object.assign(tokenObj, v.updates);
+                    tokenCacheDetail = "hit-domain";
                 }
             }
         }
@@ -354,7 +354,9 @@ export async function handleCompare({ request, env, ctx, url, corsHeaders, compa
                     Object.assign(tokenObj, v.updates);
                     tokenCacheDetail = "hit-name";
 
-                    if (tokenKeyDomain) {
+                    // Gate domain backfill on high confidence to prevent cache poisoning
+                    // Only write to domain key if confidence >= 0.85
+                    if (tokenKeyDomain && (tokenObj.confidence ?? 0) >= 0.85) {
                         ctx.waitUntil(kvPutJson(env.CACHE_KV, tokenKeyDomain, tokenObj, TOKEN_TTL_SEC));
                     }
                 }

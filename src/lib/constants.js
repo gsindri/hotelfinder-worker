@@ -38,16 +38,16 @@ export const USER_AGENT =
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36";
 
 // ---------- CONTACT TIMEOUTS ----------
-export const TIMEOUT_HOME_MS = 6000;
-export const TIMEOUT_PAGE_MS = 4000;
-export const MAX_CONTACT_PAGES = 5;
+export const TIMEOUT_HOME_MS = 4000;  // Reduced from 6000 to prevent CPU limits
+export const TIMEOUT_PAGE_MS = 3000;  // Reduced from 4000
+export const MAX_CONTACT_PAGES = 3;   // Reduced from 5 to prevent CPU limits
 
 // ---------- SEARCH API FALLBACK CONFIG ----------
 export const BRAVE_SEARCH_ENDPOINT = "https://api.search.brave.com/res/v1/web/search";
 export const GOOGLE_CSE_ENDPOINT = "https://customsearch.googleapis.com/customsearch/v1";
 export const FALLBACK_SEARCH_TIMEOUT_MS = 8000;
 export const FALLBACK_SEARCH_MAX_RESULTS = 8;
-export const FALLBACK_SEARCH_MAX_PAGES_TO_CRAWL = 5;
+export const FALLBACK_SEARCH_MAX_PAGES_TO_CRAWL = 3;  // Reduced from 5 to prevent CPU limits
 export const FALLBACK_SEARCH_CACHE_TTL_SEC = 7 * 24 * 60 * 60; // 7 days
 export const MAX_EMAIL_PARSE_BYTES = 2 * 1024 * 1024; // 2 MB
 
@@ -164,6 +164,8 @@ export const KEY_GROUP_BOOST_CAP = 0.24;    // max total boost
 
 // ---------- DOMAIN BOOST ----------
 export const MIN_SCORE_FOR_DOMAIN_BOOST = 0.55;
+export const DOMAIN_BACKFILL_MIN_CONF = 0.85;  // Min confidence to backfill domain cache from name hit
+export const HIT_DOMAIN_MIN_SCORE = 0.70;      // Min baseScore for hit-domain validation
 
 // ---------- ACCOMMODATION TYPE SIGNALS ----------
 // Soft signals (boost/penalty), never hard mismatch.
