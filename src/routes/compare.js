@@ -436,6 +436,24 @@ export async function handleCompare({ request, env, ctx, url, corsHeaders, compa
             }, 404, corsHeaders);
         }
 
+        // Guard: Reject very low confidence matches as "no confident match"
+        // This prevents garbage inputs (e.g., "Availability") from returning random hotels
+        const MIN_CONFIDENCE_TO_ACCEPT = 0.25;
+        if ((picked?.confidence ?? 0) < MIN_CONFIDENCE_TO_ACCEPT) {
+            const lowConfidenceSummary = summarizeCandidates(picked?.allCandidates, 5);
+            return jsonResponse({
+                ok: false,
+                error: "No confident match found",
+                error_code: "LOW_CONFIDENCE_MATCH",
+                hotelName,
+                officialDomain: officialDomain || null,
+                confidence: picked?.confidence ?? 0,
+                candidateSummary: lowConfidenceSummary,
+                ctxDebug,
+                debug: debugSearch
+            }, 404, corsHeaders);
+        }
+
         // Capture candidate summary for uncertain match explanation
         searchCandidateSummary = summarizeCandidates(picked?.allCandidates, 3);
 
